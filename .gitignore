@@ -1,0 +1,6 @@
+stock-scanner-key.json
+.env
+.DS_Store
+old/
+*.parquet
+__pycache__/
