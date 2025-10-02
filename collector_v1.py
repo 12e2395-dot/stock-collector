@@ -1,17 +1,18 @@
-# collector_v1.py  — PyKRX → Google Sheets 업서트 자동화
+# collector_v1.py — PyKRX → Google Sheets 업서트 자동화 (최종 안정판)
 # 실행:  python collector_v1.py
 # 필요: pip install pykrx pandas gspread google-auth google-auth-oauthlib google-auth-httplib2
 
-import os, time, math, tempfile
+import os, time, math, tempfile, random
 import pandas as pd
 from pykrx import stock
 import gspread
+from gspread.exceptions import APIError
 
 # ====== 설정 ======
-RAW_SHEET  = "raw_daily"          # 원천 데이터 탭
+RAW_SHEET  = "raw_daily"                         # 원천 데이터 탭
 SLEEP_SEC  = float(os.environ.get("SLEEP_SEC", "0.4"))   # 호출 속도(과다호출 방지)
 
-# GitHub Secrets에서 읽기
+# GitHub Actions / 로컬 환경변수에서 읽기
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID             = os.environ.get("SHEET_ID")
 
@@ -22,13 +23,13 @@ def open_sheet():
     if not SHEET_ID:
         raise RuntimeError("SHEET_ID env not found")
 
-    # Secrets에 저장된 JSON 문자열을 임시 파일로 저장 후 인증
+    # Secrets의 JSON 문자열을 임시 파일로 저장해 인증
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fp:
         fp.write(SERVICE_ACCOUNT_JSON)
         sa_path = fp.name
 
     gc = gspread.service_account(filename=sa_path)
-    return gc.open_by_key(SHEET_ID)   # 시트 이름이 아니라 ID로 직접 열기
+    return gc.open_by_key(SHEET_ID)
 
 # ====== 수집 날짜(장 마감 후 22시 기준) ======
 def target_kr_date():
@@ -72,7 +73,7 @@ def fetch_one(date, t, kospi_set, kosdaq_set):
     high   = to_int(g(row, "고가"))
     low    = to_int(g(row, "저가"))
     volume = to_int(g(row, "거래량"))
-    value  = to_int(g(row, "거래대금"))
+    value  = to_int(g(row, "거래대금"))  # 없으면 None 가능
 
     # Fundamental (EPS/BPS/PER/PBR/DIV/DPS)
     EPS = BPS = PER = PBR = DIV = DPS = None
@@ -102,6 +103,7 @@ def fetch_one(date, t, kospi_set, kosdaq_set):
     # 시장 구분
     market = "KOSPI" if t in kospi_set else ("KOSDAQ" if t in kosdaq_set else "")
 
+    # 정확히 18개 컬럼 반환
     return [date, t, name, market, close, open_, high, low, volume, value,
             mktcap, shares_out, EPS, BPS, PER, PBR, DIV, DPS]
 
@@ -118,24 +120,68 @@ def collect_and_upload():
 
     header = ["date","ticker","name","market","close","open","high","low","volume","value",
               "mktcap","shares_out","EPS","BPS","PER","PBR","DIV","DPS"]
+    N_COLS = len(header)
 
+    # --- 1) 헤더 강제 보정 (A1에 header 없으면 삽입) ---
+    try:
+        first = ws.row_values(1)
+    except Exception:
+        first = []
+    if not first or (len(first) == 0) or (first[0] != "date"):
+        ws.insert_row(header, 1)  # 기존 데이터는 2행으로 밀림(안전)
+    # 최신 전체값 재조회
     all_vals = ws.get_all_values()
-    if len(all_vals) == 0:
-        ws.append_row(header)
-        all_vals = [header]
 
-    if len(all_vals) > 1:
-        existing = {(r[0], r[1]) for r in all_vals[1:]}
-    else:
-        existing = set()
+    # --- 2) 기존 키 세트(중복 방지) ---
+    existing = {(r[0], r[1]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
 
-    batch = []
+    # --- 3) 업로드 안전화 유틸 ---
+    def normalize(rec):
+        """길이/타입 안전화: None→'' 치환 + 정확히 18열만 허용"""
+        if rec is None:
+            return None
+        if len(rec) != N_COLS:
+            print(f"[SKIP] bad length {len(rec)} for {rec[:3]}...")
+            return None
+        return [("" if x is None else x) for x in rec]
+
+    def append_rows_safe(rows, tag=""):
+        """
+        rows: List[List[Any]]
+        table_range="A1"로 A열 앵커 고정. 500/503 등 일시 에러는 지수 백오프로 재시도.
+        반복 실패 시 반으로 쪼개 재귀 업로드.
+        """
+        if not rows:
+            return
+        max_retries = 5
+        delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+                if tag:
+                    print(f"[OK] appended {len(rows)} rows ({tag})")
+                return
+            except APIError as e:
+                print(f"[WARN] append_rows failed (attempt {attempt+1}/{max_retries}, size={len(rows)}): {e}")
+                time.sleep(delay + random.uniform(0, 0.5))
+                delay = min(delay * 2, 8.0)
+        if len(rows) == 1:
+            print(f"[ERROR] permanently failed for a single row: {rows[0][:3]}")
+            return
+        mid = len(rows) // 2
+        append_rows_safe(rows[:mid], tag=f"{tag}-split1")
+        append_rows_safe(rows[mid:], tag=f"{tag}-split2")
+
+    # --- 4) 루프 & 배치 업로드 ---
+    batch, uploaded = [], 0
+    BATCH_TARGET = 100  # 안정성 위해 100행 단위로 업로드
+
     for i, t in enumerate(tickers, 1):
         key = (date, t)
         if key in existing:
             continue
         try:
-            rec = fetch_one(date, t, kospi_set, kosdaq_set)
+            rec = normalize(fetch_one(date, t, kospi_set, kosdaq_set))
             if rec:
                 batch.append(rec)
         except Exception as e:
@@ -143,14 +189,16 @@ def collect_and_upload():
         finally:
             time.sleep(SLEEP_SEC)
 
-        if len(batch) >= 200:
-            ws.append_rows(batch, value_input_option="RAW")
+        if len(batch) >= BATCH_TARGET:
+            append_rows_safe(batch, tag=f"upto#{i}")
+            uploaded += len(batch)
             batch.clear()
-            print(f"Uploaded up to #{i}")
+            print(f"Uploaded up to #{i} (total uploaded so far: {uploaded})")
 
     if batch:
-        ws.append_rows(batch, value_input_option="RAW")
-        print(f"Uploaded final batch ({len(batch)} rows)")
+        append_rows_safe(batch, tag="final")
+        uploaded += len(batch)
+        print(f"Uploaded final batch ({len(batch)} rows). Total uploaded: {uploaded}")
 
 if __name__ == "__main__":
     collect_and_upload()
