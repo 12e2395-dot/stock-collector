@@ -1,19 +1,11 @@
-# collector_dart.py — OpenDart API로 재무제표 수집 → fin_statement 시트
-# 실행: python collector_dart.py
-# 필요: pip install requests pandas gspread google-auth
+# collector_dart.py — 속도 최적화
 
 import os, time, tempfile, zipfile, io
 import requests
-import pandas as pd
 import gspread
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-print("=" * 60)
-print("collector_dart.py START")
-print("=" * 60)
-
-# ====== 설정 ======
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
 FIN_SHEET = "fin_statement"
 MAX_DAILY_CALLS = 9500
@@ -21,10 +13,13 @@ MAX_DAILY_CALLS = 9500
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
-# ====== Google Sheets 열기 ======
+print("="*60)
+print("collector_dart.py START")
+print("="*60)
+
 def open_sheet():
     if not SERVICE_ACCOUNT_JSON or not SHEET_ID:
-        raise RuntimeError("SERVICE_ACCOUNT_JSON or SHEET_ID not found")
+        raise RuntimeError("ENV missing")
     
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fp:
         fp.write(SERVICE_ACCOUNT_JSON)
@@ -33,27 +28,26 @@ def open_sheet():
     gc = gspread.service_account(filename=sa_path)
     return gc.open_by_key(SHEET_ID)
 
-# ====== OpenDart: 종목 코드 → 기업 고유번호 매핑 ======
 def get_corp_code_map():
-    """전체 상장사 코드 맵 다운로드 (ZIP 파일)"""
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": DART_API_KEY}
     
     try:
-        print("[INFO] Downloading corp_code ZIP file...")
-        response = requests.get(url, params=params, timeout=30)
+        print("[1/4] Downloading corpCode ZIP...")
+        response = requests.get(url, params=params, timeout=15)
         
         if response.status_code != 200:
-            print(f"[ERROR] corpCode API HTTP {response.status_code}")
+            print(f"[ERROR] HTTP {response.status_code}")
             return {}
         
-        # ZIP 파일 압축 해제
+        print(f"[2/4] Extracting ZIP ({len(response.content)/1024/1024:.1f}MB)...")
+        
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-            xml_filename = z.namelist()[0]  # CORPCODE.xml
+            xml_filename = z.namelist()[0]
             with z.open(xml_filename) as f:
                 xml_data = f.read()
         
-        # XML 파싱
+        print(f"[3/4] Parsing XML...")
         root = ET.fromstring(xml_data)
         mapping = {}
         
@@ -61,25 +55,17 @@ def get_corp_code_map():
             corp_code = item.findtext('corp_code', '').strip()
             stock_code = item.findtext('stock_code', '').strip()
             
-            # 상장사만 (stock_code가 6자리)
             if stock_code and len(stock_code) == 6:
                 mapping[stock_code] = corp_code
         
-        print(f"[OK] Loaded {len(mapping)} corp_codes")
+        print(f"[4/4] Loaded {len(mapping)} corp_codes")
         return mapping
         
     except Exception as e:
-        print(f"[ERROR] get_corp_code_map: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[ERROR] {e}")
         return {}
 
-# ====== OpenDart: 단일 회사 재무제표 조회 ======
 def fetch_financials(corp_code, year, quarter):
-    """
-    year: "2024"
-    quarter: "11011" (1분기), "11012" (반기), "11013" (3분기), "11014" (연간)
-    """
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
     params = {
         "crtfc_key": DART_API_KEY,
@@ -90,7 +76,7 @@ def fetch_financials(corp_code, year, quarter):
     }
     
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(url, params=params, timeout=5)  # 15초→5초
         if response.status_code != 200:
             return None
         
@@ -126,12 +112,11 @@ def fetch_financials(corp_code, year, quarter):
                 result["자산총계"] = value
         
         return result
-        
-    except Exception as e:
+    except:
         return None
 
-# ====== 메인: 전체 종목 재무제표 수집 ======
 def collect_financials():
+    print("[STEP 1/5] Opening Sheets...")
     sheet = open_sheet()
     
     try:
@@ -151,12 +136,15 @@ def collect_financials():
     if not first or first[0] != "ticker":
         ws.insert_row(header, 1)
     
+    print("[STEP 2/5] Loading existing...")
     all_vals = ws.get_all_values()
     existing = {(r[0], r[2], r[3]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
+    print(f"  → {len(existing)} existing records")
     
+    print("[STEP 3/5] Getting corp_codes...")
     corp_map = get_corp_code_map()
     if not corp_map:
-        print("[ERROR] Failed to load corp_code mapping")
+        print("[ABORT] No corp_codes")
         return
     
     current_year = datetime.now().year
@@ -167,18 +155,11 @@ def collect_financials():
     is_initial = not required_years.issubset(existing_years) or len(existing) < 15000
     
     if is_initial:
-        print(f"[INITIAL MODE] Collecting 2 years of data")
-        print(f"[INFO] Current progress: {len(existing)} records")
-        print(f"[INFO] Will stop at {MAX_DAILY_CALLS} API calls")
+        print(f"[MODE] INITIAL ({len(existing)} records)")
         years = [str(current_year - 1), str(current_year)]
-        quarters = [
-            ("11011", "Q1"),
-            ("11012", "Q2"),
-            ("11013", "Q3"),
-            ("11014", "Q4")
-        ]
+        quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     else:
-        print("[INCREMENTAL MODE] Collecting current quarter only")
+        print("[MODE] INCREMENTAL")
         years = [str(current_year)]
         if current_month <= 3:
             quarters = [("11011", "Q1")]
@@ -189,74 +170,59 @@ def collect_financials():
         else:
             quarters = [("11014", "Q4")]
     
+    print(f"[STEP 4/5] Collection: {len(corp_map)} tickers")
+    
     batch = []
-    api_call_count = 0
+    api_calls = 0
     new_records = 0
+    last_print = time.time()
     
     for ticker, corp_code in corp_map.items():
         for year in years:
             for q_code, q_name in quarters:
-                if api_call_count >= MAX_DAILY_CALLS:
-                    print(f"\n[LIMIT REACHED] {MAX_DAILY_CALLS} API calls used")
-                    print(f"[INFO] Added {new_records} new records today")
+                if api_calls >= MAX_DAILY_CALLS:
                     if batch:
                         ws.append_rows(batch, value_input_option="RAW")
-                        print(f"[OK] Final batch uploaded: {len(batch)} rows")
-                    print("[INFO] Progress saved. Will resume tomorrow.")
+                    print(f"\n[LIMIT] {api_calls} calls, {new_records} new")
                     return
                 
                 key = (ticker, year, q_name)
                 if key in existing:
                     continue
                 
-                api_call_count += 1
+                api_calls += 1
                 fin = fetch_financials(corp_code, year, q_code)
                 
-                if not fin:
-                    time.sleep(0.05)
-                    continue
+                if fin:
+                    row = [
+                        ticker, corp_code, year, q_name, f"{year}-{q_name}",
+                        fin.get("매출액", 0), fin.get("영업이익", 0), fin.get("당기순이익", 0),
+                        fin.get("자기자본", 0), fin.get("부채총계", 0), fin.get("자산총계", 0)
+                    ]
+                    batch.append(row)
+                    existing.add(key)
+                    new_records += 1
                 
-                date_str = f"{year}-{q_name}"
-                row = [
-                    ticker, corp_code, year, q_name, date_str,
-                    fin.get("매출액", 0),
-                    fin.get("영업이익", 0),
-                    fin.get("당기순이익", 0),
-                    fin.get("자기자본", 0),
-                    fin.get("부채총계", 0),
-                    fin.get("자산총계", 0)
-                ]
-                
-                batch.append(row)
-                existing.add(key)
-                new_records += 1
-                
-                if len(batch) >= 100:
+                if len(batch) >= 200:  # 100→200으로 증가
                     ws.append_rows(batch, value_input_option="RAW")
-                    print(f"[PROGRESS] API: {api_call_count}/{MAX_DAILY_CALLS} | New: {new_records} | Total: {len(existing)}")
                     batch.clear()
+                    
+                    # 5초마다 진행 상황 출력
+                    if time.time() - last_print > 5:
+                        print(f"  → API: {api_calls}/{MAX_DAILY_CALLS} | New: {new_records}")
+                        last_print = time.time()
                 
-                time.sleep(0.05)
+                time.sleep(0.03)  # 0.05→0.03으로 단축 (초당 33회)
     
     if batch:
         ws.append_rows(batch, value_input_option="RAW")
-        print(f"[OK] Final batch: {len(batch)} rows")
     
-    print(f"\n{'='*60}")
-    print(f"[COMPLETE] Collection finished")
-    print(f"  - API calls used: {api_call_count}")
-    print(f"  - New records added: {new_records}")
-    print(f"  - Total records: {len(existing)}")
-    
-    if is_initial and len(existing) < 15000:
-        print(f"  - Status: Initial collection incomplete")
-        print(f"  - Next run will continue")
-    else:
-        print(f"  - Status: All data collected")
-        print(f"  - Next run will use incremental mode")
-    print(f"{'='*60}")
+    print(f"\n[STEP 5/5] DONE: {api_calls} calls, {new_records} new records")
 
 if __name__ == "__main__":
-    print("[START] Beginning collection...")
-    collect_financials()
-    print("DONE")
+    try:
+        collect_financials()
+    except Exception as e:
+        print(f"[FATAL] {e}")
+        import traceback
+        traceback.print_exc()
