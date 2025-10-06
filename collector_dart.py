@@ -1,10 +1,13 @@
-# collector_dart.py — 속도 최적화
+# collector_dart.py — 배치 축소 + 실시간 로그
 
-import os, time, tempfile, zipfile, io
+import os, sys, time, tempfile, zipfile, io
 import requests
 import gspread
 from datetime import datetime
 import xml.etree.ElementTree as ET
+
+# 출력 버퍼링 해제
+os.environ['PYTHONUNBUFFERED'] = '1'
 
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
 FIN_SHEET = "fin_statement"
@@ -13,9 +16,9 @@ MAX_DAILY_CALLS = 30000
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
-print("="*60)
-print("collector_dart.py START")
-print("="*60)
+print("="*60, flush=True)
+print("collector_dart.py START", flush=True)
+print("="*60, flush=True)
 
 def open_sheet():
     if not SERVICE_ACCOUNT_JSON or not SHEET_ID:
@@ -33,21 +36,21 @@ def get_corp_code_map():
     params = {"crtfc_key": DART_API_KEY}
     
     try:
-        print("[1/4] Downloading corpCode ZIP...")
+        print("[1/4] Downloading corpCode ZIP...", flush=True)
         response = requests.get(url, params=params, timeout=15)
         
         if response.status_code != 200:
-            print(f"[ERROR] HTTP {response.status_code}")
+            print(f"[ERROR] HTTP {response.status_code}", flush=True)
             return {}
         
-        print(f"[2/4] Extracting ZIP ({len(response.content)/1024/1024:.1f}MB)...")
+        print(f"[2/4] Extracting ZIP ({len(response.content)/1024/1024:.1f}MB)...", flush=True)
         
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             xml_filename = z.namelist()[0]
             with z.open(xml_filename) as f:
                 xml_data = f.read()
         
-        print(f"[3/4] Parsing XML...")
+        print(f"[3/4] Parsing XML...", flush=True)
         root = ET.fromstring(xml_data)
         mapping = {}
         
@@ -58,11 +61,11 @@ def get_corp_code_map():
             if stock_code and len(stock_code) == 6:
                 mapping[stock_code] = corp_code
         
-        print(f"[4/4] Loaded {len(mapping)} corp_codes")
+        print(f"[4/4] Loaded {len(mapping)} corp_codes", flush=True)
         return mapping
         
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {e}", flush=True)
         return {}
 
 def fetch_financials(corp_code, year, quarter):
@@ -76,7 +79,7 @@ def fetch_financials(corp_code, year, quarter):
     }
     
     try:
-        response = requests.get(url, params=params, timeout=5)  # 15초→5초
+        response = requests.get(url, params=params, timeout=5)
         if response.status_code != 200:
             return None
         
@@ -116,7 +119,7 @@ def fetch_financials(corp_code, year, quarter):
         return None
 
 def collect_financials():
-    print("[STEP 1/5] Opening Sheets...")
+    print("[STEP 1/5] Opening Sheets...", flush=True)
     sheet = open_sheet()
     
     try:
@@ -136,15 +139,15 @@ def collect_financials():
     if not first or first[0] != "ticker":
         ws.insert_row(header, 1)
     
-    print("[STEP 2/5] Loading existing...")
+    print("[STEP 2/5] Loading existing...", flush=True)
     all_vals = ws.get_all_values()
     existing = {(r[0], r[2], r[3]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
-    print(f"  → {len(existing)} existing records")
+    print(f"  → {len(existing)} existing records", flush=True)
     
-    print("[STEP 3/5] Getting corp_codes...")
+    print("[STEP 3/5] Getting corp_codes...", flush=True)
     corp_map = get_corp_code_map()
     if not corp_map:
-        print("[ABORT] No corp_codes")
+        print("[ABORT] No corp_codes", flush=True)
         return
     
     current_year = datetime.now().year
@@ -155,11 +158,11 @@ def collect_financials():
     is_initial = not required_years.issubset(existing_years) or len(existing) < 15000
     
     if is_initial:
-        print(f"[MODE] INITIAL ({len(existing)} records)")
+        print(f"[MODE] INITIAL ({len(existing)} records)", flush=True)
         years = [str(current_year - 1), str(current_year)]
         quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     else:
-        print("[MODE] INCREMENTAL")
+        print("[MODE] INCREMENTAL", flush=True)
         years = [str(current_year)]
         if current_month <= 3:
             quarters = [("11011", "Q1")]
@@ -170,7 +173,7 @@ def collect_financials():
         else:
             quarters = [("11014", "Q4")]
     
-    print(f"[STEP 4/5] Collection: {len(corp_map)} tickers")
+    print(f"[STEP 4/5] Collection: {len(corp_map)} tickers", flush=True)
     
     batch = []
     api_calls = 0
@@ -183,7 +186,7 @@ def collect_financials():
                 if api_calls >= MAX_DAILY_CALLS:
                     if batch:
                         ws.append_rows(batch, value_input_option="RAW")
-                    print(f"\n[LIMIT] {api_calls} calls, {new_records} new")
+                    print(f"\n[LIMIT] {api_calls} calls, {new_records} new", flush=True)
                     return
                 
                 key = (ticker, year, q_name)
@@ -203,26 +206,23 @@ def collect_financials():
                     existing.add(key)
                     new_records += 1
                 
-                if len(batch) >= 200:  # 100→200으로 증가
+                # 50개마다 저장 (200 → 50)
+                if len(batch) >= 50:
                     ws.append_rows(batch, value_input_option="RAW")
                     batch.clear()
-                    
-                    # 5초마다 진행 상황 출력
-                    if time.time() - last_print > 5:
-                        print(f"  → API: {api_calls}/{MAX_DAILY_CALLS} | New: {new_records}")
-                        last_print = time.time()
+                    print(f"[SAVE] API: {api_calls}/{MAX_DAILY_CALLS} | New: {new_records}", flush=True)
                 
-                time.sleep(0.03)  # 0.05→0.03으로 단축 (초당 33회)
+                time.sleep(0.03)
     
     if batch:
         ws.append_rows(batch, value_input_option="RAW")
     
-    print(f"\n[STEP 5/5] DONE: {api_calls} calls, {new_records} new records")
+    print(f"\n[STEP 5/5] DONE: {api_calls} calls, {new_records} new records", flush=True)
 
 if __name__ == "__main__":
     try:
         collect_financials()
     except Exception as e:
-        print(f"[FATAL] {e}")
+        print(f"[FATAL] {e}", flush=True)
         import traceback
         traceback.print_exc()
