@@ -1,4 +1,4 @@
-# collector_dart.py — 하이브리드 최종판 (병렬+세션+증분업데이트)
+# collector_dart.py — 하이브리드 최종판 (상장종목만 필터링)
 
 import os, sys, time, tempfile, zipfile, io, threading
 import requests
@@ -12,9 +12,9 @@ os.environ['PYTHONUNBUFFERED'] = '1'
 
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
 FIN_SHEET = "fin_statement"
-MAX_DAILY_CALLS = 20000
+MAX_DAILY_CALLS = 28000
 MAX_WORKERS = 6
-DART_RPS = 4.0  # 초당 최대 요청
+DART_RPS = 4.0
 BATCH_SIZE = 200
 TIMEOUT = 8
 
@@ -99,11 +99,22 @@ def append_rows_safe(ws, rows, tag=""):
         except Exception as e:
             time.sleep(1.5 ** attempt)
     
-    # 분할 재시도
     if len(rows) > 1:
         mid = len(rows) // 2
         append_rows_safe(ws, rows[:mid], f"{tag}-A")
         append_rows_safe(ws, rows[mid:], f"{tag}-B")
+
+# --------- 상장 종목 필터링 ---------
+def get_listed_tickers():
+    """현재 KOSPI/KOSDAQ 상장 종목만"""
+    try:
+        from pykrx import stock
+        kospi = stock.get_market_ticker_list(market="KOSPI")
+        kosdaq = stock.get_market_ticker_list(market="KOSDAQ")
+        return set(kospi + kosdaq)
+    except Exception as e:
+        print(f"[WARN] Failed to get listed tickers: {e}", flush=True)
+        return set()
 
 # --------- corpCode 다운로드 ---------
 def get_corp_code_map():
@@ -199,7 +210,7 @@ def fetch_financials(corp_code, year, quarter):
 
 # --------- 메인 수집 ---------
 def collect_financials():
-    print("[STEP 1/6] Opening Sheets...", flush=True)
+    print("[STEP 1/7] Opening Sheets...", flush=True)
     sheet = open_sheet()
     
     try:
@@ -219,16 +230,24 @@ def collect_financials():
     if not first or first[0] != "ticker":
         ws.insert_row(header, 1)
     
-    print("[STEP 2/6] Loading existing...", flush=True)
+    print("[STEP 2/7] Loading existing...", flush=True)
     all_vals = ws.get_all_values()
     existing = {(r[0], r[2], r[3]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
     print(f"  → {len(existing)} existing records", flush=True)
     
-    print("[STEP 3/6] Getting corp_codes...", flush=True)
+    print("[STEP 3/7] Getting corp_codes...", flush=True)
     corp_map = get_corp_code_map()
     if not corp_map:
         print("[ABORT]", flush=True)
         return
+    
+    print("[STEP 4/7] Filtering to listed stocks...", flush=True)
+    listed = get_listed_tickers()
+    if listed:
+        corp_map = {k: v for k, v in corp_map.items() if k in listed}
+        print(f"  → Filtered to {len(corp_map)} KOSPI/KOSDAQ stocks", flush=True)
+    else:
+        print("[WARN] Could not filter, using all corp_codes", flush=True)
     
     current_year = datetime.now().year
     
@@ -243,11 +262,10 @@ def collect_financials():
         quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     else:
         print("[MODE] INCREMENTAL", flush=True)
-        # 증분: 현재 연도 전체 분기 시도 (공시된 것만 저장됨)
         years = [str(current_year)]
         quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     
-    print("[STEP 4/6] Building tasks...", flush=True)
+    print("[STEP 5/7] Building tasks...", flush=True)
     tasks = []
     for ticker, corp_code in corp_map.items():
         for year in years:
@@ -264,7 +282,7 @@ def collect_financials():
         print("[DONE] No new data to collect", flush=True)
         return
     
-    print(f"[STEP 5/6] Fetching (workers={MAX_WORKERS})...", flush=True)
+    print(f"[STEP 6/7] Fetching (workers={MAX_WORKERS})...", flush=True)
     
     api_calls = 0
     new_records = 0
@@ -276,7 +294,6 @@ def collect_financials():
         nonlocal api_calls, new_records
         ticker, corp_code, year, q_code, q_name = task
         
-        # 일일 호출 상한
         with call_lock:
             if api_calls >= MAX_DAILY_CALLS:
                 return None
@@ -319,7 +336,6 @@ def collect_financials():
             if completed % 1000 == 0:
                 print(f"[PROGRESS] {completed}/{total} | API: {api_calls} | New: {new_records}", flush=True)
             
-            # 상한 체크
             with call_lock:
                 if api_calls >= MAX_DAILY_CALLS:
                     print(f"[LIMIT] Hit {MAX_DAILY_CALLS}", flush=True)
@@ -328,7 +344,7 @@ def collect_financials():
     if batch:
         append_rows_safe(ws, batch, "final")
     
-    print(f"[STEP 6/6] DONE: {api_calls} calls, {new_records} new", flush=True)
+    print(f"[STEP 7/7] DONE: {api_calls} calls, {new_records} new", flush=True)
 
 if __name__ == "__main__":
     try:
