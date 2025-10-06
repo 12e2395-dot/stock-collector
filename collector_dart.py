@@ -147,13 +147,19 @@ def collect_financials():
         print("[ERROR] Failed to load corp_code mapping")
         return
     
-    # 수집 모드 결정
-    is_initial = len(existing) < 1000
+    # 수집 모드 결정: 15,000건 미만이면 초기 수집 (2년 × 4분기 × ~2000종목)
     current_year = datetime.now().year
     current_month = datetime.now().month
     
+    # 2년치 데이터 완성도 체크
+    required_years = {str(current_year - 1), str(current_year)}
+    existing_years = {r[2] for r in all_vals[1:]} if len(all_vals) > 1 else set()
+    is_initial = not required_years.issubset(existing_years) or len(existing) < 15000
+    
     if is_initial:
-        print(f"[INITIAL MODE] Collecting 2 years, will stop at {MAX_DAILY_CALLS} API calls")
+        print(f"[INITIAL MODE] Collecting 2 years of data")
+        print(f"[INFO] Current progress: {len(existing)} records")
+        print(f"[INFO] Will stop at {MAX_DAILY_CALLS} API calls and resume tomorrow")
         years = [str(current_year - 1), str(current_year)]
         quarters = [
             ("11011", "Q1"),
@@ -175,17 +181,19 @@ def collect_financials():
     
     batch = []
     api_call_count = 0
+    new_records = 0
     
     for ticker, corp_code in corp_map.items():
         for year in years:
             for q_code, q_name in quarters:
                 # API 제한 체크
                 if api_call_count >= MAX_DAILY_CALLS:
-                    print(f"\n[LIMIT] Reached daily API limit ({MAX_DAILY_CALLS})")
-                    print(f"[INFO] Progress saved. Run again tomorrow to continue.")
+                    print(f"\n[LIMIT REACHED] {MAX_DAILY_CALLS} API calls used")
+                    print(f"[INFO] Added {new_records} new records today")
                     if batch:
                         ws.append_rows(batch, value_input_option="RAW")
                         print(f"[OK] Final batch uploaded: {len(batch)} rows")
+                    print("[INFO] Progress saved. Will resume tomorrow automatically.")
                     return
                 
                 key = (ticker, year, q_name)
@@ -196,6 +204,7 @@ def collect_financials():
                 fin = fetch_financials(corp_code, year, q_code)
                 
                 if not fin:
+                    time.sleep(0.05)
                     continue
                 
                 date_str = f"{year}-{q_name}"
@@ -210,30 +219,35 @@ def collect_financials():
                 ]
                 
                 batch.append(row)
-                existing.add(key)  # 메모리에도 추가 (중복 방지)
+                existing.add(key)
+                new_records += 1
                 
                 # 100개씩 배치 업로드
                 if len(batch) >= 100:
                     ws.append_rows(batch, value_input_option="RAW")
-                    print(f"[OK] Uploaded batch (API calls: {api_call_count}/{MAX_DAILY_CALLS})")
+                    print(f"[PROGRESS] API: {api_call_count}/{MAX_DAILY_CALLS} | New: {new_records} | Total: {len(existing)}")
                     batch.clear()
                 
-                time.sleep(0.05)  # API 제한 (초당 20회)
-        
-        # 진행 상황 출력 (100개 종목마다)
-        if api_call_count % 400 == 0:
-            print(f"[PROGRESS] {api_call_count}/{MAX_DAILY_CALLS} API calls used")
+                time.sleep(0.05)
     
     # 남은 데이터 업로드
     if batch:
         ws.append_rows(batch, value_input_option="RAW")
-        print(f"[OK] Final upload: {len(batch)} rows")
+        print(f"[OK] Final batch: {len(batch)} rows")
     
-    print(f"\n[COMPLETE] Total API calls: {api_call_count}")
-    if is_initial and api_call_count >= MAX_DAILY_CALLS:
-        print("[INFO] Initial collection incomplete. Will resume tomorrow.")
+    print(f"\n{'='*60}")
+    print(f"[COMPLETE] Collection finished")
+    print(f"  - API calls used: {api_call_count}")
+    print(f"  - New records added: {new_records}")
+    print(f"  - Total records: {len(existing)}")
+    
+    if is_initial and len(existing) < 15000:
+        print(f"  - Status: Initial collection incomplete")
+        print(f"  - Next run will continue from current progress")
     else:
-        print("[INFO] Collection finished successfully.")
+        print(f"  - Status: All data collected successfully")
+        print(f"  - Next run will use incremental mode")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     collect_financials()
