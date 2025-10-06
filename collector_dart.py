@@ -1,4 +1,4 @@
-# collector_dart.py — 하이브리드 (병렬+세션+기존구조유지)
+# collector_dart.py — 하이브리드 최종판 (병렬+세션+증분업데이트)
 
 import os, sys, time, tempfile, zipfile, io, threading
 import requests
@@ -231,8 +231,8 @@ def collect_financials():
         return
     
     current_year = datetime.now().year
-    current_month = datetime.now().month
     
+    # 초기/증분 모드 판단
     required_years = {str(current_year - 1), str(current_year)}
     existing_years = {r[2] for r in all_vals[1:]} if len(all_vals) > 1 else set()
     is_initial = not required_years.issubset(existing_years) or len(existing) < 15000
@@ -243,16 +243,9 @@ def collect_financials():
         quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     else:
         print("[MODE] INCREMENTAL", flush=True)
+        # 증분: 현재 연도 전체 분기 시도 (공시된 것만 저장됨)
         years = [str(current_year)]
-        month = current_month
-        if month <= 3:
-            quarters = [("11011", "Q1")]
-        elif month <= 6:
-            quarters = [("11012", "Q2")]
-        elif month <= 9:
-            quarters = [("11013", "Q3")]
-        else:
-            quarters = [("11014", "Q4")]
+        quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
     
     print("[STEP 4/6] Building tasks...", flush=True)
     tasks = []
@@ -266,6 +259,10 @@ def collect_financials():
     
     total = len(tasks)
     print(f"  → {total} tasks pending", flush=True)
+    
+    if total == 0:
+        print("[DONE] No new data to collect", flush=True)
+        return
     
     print(f"[STEP 5/6] Fetching (workers={MAX_WORKERS})...", flush=True)
     
