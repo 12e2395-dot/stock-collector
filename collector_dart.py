@@ -1,4 +1,4 @@
-# collector_dart.py — 최종 수정판 (올바른 분기 코드)
+# collector_dart.py — 최종 확정판 (원본 데이터 보존)
 
 import os, sys, time, tempfile, zipfile, io, threading
 import requests
@@ -21,7 +21,7 @@ SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
 print("="*60, flush=True)
-print("collector_dart.py FINAL VERSION", flush=True)
+print("collector_dart.py FINAL", flush=True)
 print(f"MAX_WORKERS={MAX_WORKERS}, RPS={DART_RPS}, BATCH={BATCH_SIZE}", flush=True)
 print("="*60, flush=True)
 
@@ -147,7 +147,6 @@ def get_corp_code_map():
 
 # --------- 재무 데이터 조회 ---------
 def fetch_financials(corp_code, year, quarter_code):
-    """CFS 시도 → 실패 시 OFS 폴백"""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
     
     for fs_div in ["CFS", "OFS"]:
@@ -246,30 +245,27 @@ def collect_financials():
     
     current_year = datetime.now().year
     
-    # 초기/증분 모드 판단
     required_years = {str(current_year - 1), str(current_year)}
     existing_years = {r[2] for r in all_vals[1:]} if len(all_vals) > 1 else set()
     is_initial = not required_years.issubset(existing_years) or len(existing) < 10000
     
-    # 올바른 분기 코드
-    # 11013: 1분기, 11012: 반기(2분기), 11014: 3분기, 11011: 사업보고서(연간)
     if is_initial:
         print(f"[MODE] INITIAL", flush=True)
         years = [str(current_year - 1), str(current_year)]
         quarters = [
-            ("11013", "Q1"),  # 1분기보고서
-            ("11012", "Q2"),  # 반기보고서
-            ("11014", "Q3"),  # 3분기보고서
-            ("11011", "Q4"),  # 사업보고서(연간)
+            ("11013", "Q1"),      # 1분기보고서
+            ("11012", "H1"),      # 반기보고서 (누적)
+            ("11014", "Q3"),      # 3분기보고서 (누적)
+            ("11011", "ANNUAL"),  # 사업보고서 (연간)
         ]
     else:
         print("[MODE] INCREMENTAL", flush=True)
         years = [str(current_year)]
         quarters = [
             ("11013", "Q1"),
-            ("11012", "Q2"),
+            ("11012", "H1"),
             ("11014", "Q3"),
-            ("11011", "Q4"),
+            ("11011", "ANNUAL"),
         ]
     
     print("[STEP 5/7] Building tasks...", flush=True)
