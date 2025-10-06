@@ -1,4 +1,4 @@
-# collector_dart.py — 하이브리드 최종판 (상장종목만 필터링)
+# collector_dart.py — 최종 수정판 (올바른 분기 코드)
 
 import os, sys, time, tempfile, zipfile, io, threading
 import requests
@@ -7,7 +7,6 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 출력 버퍼링 해제
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
@@ -22,7 +21,7 @@ SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
 print("="*60, flush=True)
-print("collector_dart.py HYBRID START", flush=True)
+print("collector_dart.py FINAL VERSION", flush=True)
 print(f"MAX_WORKERS={MAX_WORKERS}, RPS={DART_RPS}, BATCH={BATCH_SIZE}", flush=True)
 print("="*60, flush=True)
 
@@ -30,7 +29,7 @@ print("="*60, flush=True)
 _session = requests.Session()
 _session.headers.update({
     "Connection": "keep-alive",
-    "User-Agent": "dart-collector/2.0"
+    "User-Agent": "dart-collector/3.0"
 })
 
 _token_lock = threading.Lock()
@@ -38,7 +37,6 @@ _tokens = DART_RPS
 _last_refill = time.time()
 
 def _acquire_token():
-    """토큰 버킷: 초당 DART_RPS 요청 보장"""
     global _tokens, _last_refill
     while True:
         with _token_lock:
@@ -53,7 +51,6 @@ def _acquire_token():
         time.sleep(0.02)
 
 def _get_with_retry(url, params, max_retry=3):
-    """재시도 + 지수 백오프"""
     backoff = 0.5
     for attempt in range(max_retry):
         _acquire_token()
@@ -86,7 +83,6 @@ def open_sheet():
 _write_lock = threading.Lock()
 
 def append_rows_safe(ws, rows, tag=""):
-    """무손실 배치 업로드"""
     if not rows:
         return
     
@@ -106,7 +102,6 @@ def append_rows_safe(ws, rows, tag=""):
 
 # --------- 상장 종목 필터링 ---------
 def get_listed_tickers():
-    """현재 KOSPI/KOSDAQ 상장 종목만"""
     try:
         from pykrx import stock
         kospi = stock.get_market_ticker_list(market="KOSPI")
@@ -151,7 +146,7 @@ def get_corp_code_map():
         return {}
 
 # --------- 재무 데이터 조회 ---------
-def fetch_financials(corp_code, year, quarter):
+def fetch_financials(corp_code, year, quarter_code):
     """CFS 시도 → 실패 시 OFS 폴백"""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
     
@@ -160,7 +155,7 @@ def fetch_financials(corp_code, year, quarter):
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
             "bsns_year": year,
-            "reprt_code": quarter,
+            "reprt_code": quarter_code,
             "fs_div": fs_div
         }
         
@@ -254,16 +249,28 @@ def collect_financials():
     # 초기/증분 모드 판단
     required_years = {str(current_year - 1), str(current_year)}
     existing_years = {r[2] for r in all_vals[1:]} if len(all_vals) > 1 else set()
-    is_initial = not required_years.issubset(existing_years) or len(existing) < 15000
+    is_initial = not required_years.issubset(existing_years) or len(existing) < 10000
     
+    # 올바른 분기 코드
+    # 11013: 1분기, 11012: 반기(2분기), 11014: 3분기, 11011: 사업보고서(연간)
     if is_initial:
         print(f"[MODE] INITIAL", flush=True)
         years = [str(current_year - 1), str(current_year)]
-        quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
+        quarters = [
+            ("11013", "Q1"),  # 1분기보고서
+            ("11012", "Q2"),  # 반기보고서
+            ("11014", "Q3"),  # 3분기보고서
+            ("11011", "Q4"),  # 사업보고서(연간)
+        ]
     else:
         print("[MODE] INCREMENTAL", flush=True)
         years = [str(current_year)]
-        quarters = [("11011", "Q1"), ("11012", "Q2"), ("11013", "Q3"), ("11014", "Q4")]
+        quarters = [
+            ("11013", "Q1"),
+            ("11012", "Q2"),
+            ("11014", "Q3"),
+            ("11011", "Q4"),
+        ]
     
     print("[STEP 5/7] Building tasks...", flush=True)
     tasks = []
