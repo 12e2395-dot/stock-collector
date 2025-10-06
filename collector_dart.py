@@ -9,6 +9,10 @@ import gspread
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
+print("=" * 60)
+print("collector_dart.py START")
+print("=" * 60)
+
 # ====== 설정 ======
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
 FIN_SHEET = "fin_statement"
@@ -253,5 +257,6 @@ def collect_financials():
     print(f"{'='*60}")
 
 if __name__ == "__main__":
+    print("[START] Beginning collection...")
     collect_financials()
     print("DONE")
