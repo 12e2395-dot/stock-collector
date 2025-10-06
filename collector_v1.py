@@ -1,4 +1,4 @@
-# collector_v1.py — 디버깅 강화
+# collector_v1.py — 한국 시간대 + 최신 영업일 자동 탐색
 
 import os, time, math, tempfile, random
 import pandas as pd
@@ -22,8 +22,8 @@ def open_sheet():
     return gc.open_by_key(SHEET_ID)
 
 def target_kr_date():
-    """가장 최근 영업일 찾기"""
-    now = pd.Timestamp.now(tz="Asia/Tokyo")
+    """가장 최근 한국 주식시장 영업일 찾기"""
+    now = pd.Timestamp.now(tz="Asia/Seoul")
     
     # 오후 10시 이전이면 어제부터 시작
     if now.hour < 22:
@@ -38,10 +38,10 @@ def target_kr_date():
             target = target - pd.Timedelta(days=1)
             continue
         
-        # 실제 데이터가 있는지 확인 (샘플 종목으로 테스트)
+        # 실제 데이터가 있는지 확인 (삼성전자로 테스트)
         date_str = target.strftime("%Y%m%d")
         try:
-            test = stock.get_market_ohlcv_by_date(date_str, date_str, "005930")  # 삼성전자
+            test = stock.get_market_ohlcv_by_date(date_str, date_str, "005930")
             if not test.empty:
                 return date_str
         except:
@@ -57,7 +57,7 @@ def target_kr_date():
     return target.strftime("%Y%m%d")
 
 def get_quarterly_sheet_name():
-    now = pd.Timestamp.now(tz="Asia/Tokyo")
+    now = pd.Timestamp.now(tz="Asia/Seoul")
     year = now.year
     quarter = (now.month - 1) // 3 + 1
     return f"raw_daily_{year}Q{quarter}"
@@ -128,7 +128,7 @@ def collect_and_upload():
     RAW_SHEET = get_quarterly_sheet_name()
     date = target_kr_date()
     
-    print(f"[INFO] Current time: {pd.Timestamp.now(tz='Asia/Tokyo')}")
+    print(f"[INFO] Current time (KST): {pd.Timestamp.now(tz='Asia/Seoul')}")
     print(f"[INFO] Target sheet: {RAW_SHEET}")
     print(f"[INFO] Target date: {date}")
     
@@ -160,10 +160,6 @@ def collect_and_upload():
     
     existing = {(r[0], r[1]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
     print(f"[INFO] Existing records: {len(existing)}")
-    
-    if len(existing) > 0:
-        sample = list(existing)[:3]
-        print(f"[INFO] Sample existing keys: {sample}")
     
     def normalize(rec):
         if rec is None:
