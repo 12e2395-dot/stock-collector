@@ -10,7 +10,8 @@ from datetime import datetime
 
 # ====== 설정 ======
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
-FIN_SHEET = "fin_statement"  # 재무제표 저장 시트
+FIN_SHEET = "fin_statement"
+MAX_DAILY_CALLS = 9500  # 안전 마진 (실제 제한 10,000)
 
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
@@ -27,9 +28,9 @@ def open_sheet():
     gc = gspread.service_account(filename=sa_path)
     return gc.open_by_key(SHEET_ID)
 
-# ====== OpenDart: 종목 코드 → 기업 고유번호(corp_code) 매핑 ======
+# ====== OpenDart: 종목 코드 → 기업 고유번호 매핑 ======
 def get_corp_code_map():
-    """전체 상장사 코드 맵 다운로드 (1회/일 권장)"""
+    """전체 상장사 코드 맵 다운로드"""
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": DART_API_KEY}
     
@@ -39,12 +40,10 @@ def get_corp_code_map():
             print(f"[ERROR] corpCode API failed: {response.status_code}")
             return {}
         
-        # XML 파싱 간소화 (정규표현식 사용)
         import re
         pattern = r'<corp_code>(.*?)</corp_code>.*?<stock_code>(.*?)</stock_code>'
         matches = re.findall(pattern, response.text, re.DOTALL)
         
-        # stock_code(6자리) → corp_code(8자리) 매핑
         mapping = {}
         for corp, stock in matches:
             stock = stock.strip()
@@ -70,7 +69,7 @@ def fetch_financials(corp_code, year, quarter):
         "corp_code": corp_code,
         "bsns_year": year,
         "reprt_code": quarter,
-        "fs_div": "CFS"  # 연결재무제표 (OFS=개별재무제표)
+        "fs_div": "CFS"
     }
     
     try:
@@ -86,7 +85,6 @@ def fetch_financials(corp_code, year, quarter):
         if not items:
             return None
         
-        # 필요한 계정과목 추출
         result = {}
         for item in items:
             account = item.get("account_nm", "")
@@ -139,7 +137,7 @@ def collect_financials():
     if not first or first[0] != "ticker":
         ws.insert_row(header, 1)
     
-    # 기존 데이터 조회 (중복 방지)
+    # 기존 데이터 조회
     all_vals = ws.get_all_values()
     existing = {(r[0], r[2], r[3]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
     
@@ -149,26 +147,54 @@ def collect_financials():
         print("[ERROR] Failed to load corp_code mapping")
         return
     
-    # 수집 대상: 최근 2년, 분기별
+    # 수집 모드 결정
+    is_initial = len(existing) < 1000
     current_year = datetime.now().year
-    years = [str(current_year - 1), str(current_year)]
-    quarters = {
-        "11014": "Q4",  # 연간
-        "11013": "Q3",  # 3분기
-        "11012": "Q2",  # 반기
-        "11011": "Q1"   # 1분기
-    }
+    current_month = datetime.now().month
+    
+    if is_initial:
+        print(f"[INITIAL MODE] Collecting 2 years, will stop at {MAX_DAILY_CALLS} API calls")
+        years = [str(current_year - 1), str(current_year)]
+        quarters = [
+            ("11011", "Q1"),
+            ("11012", "Q2"),
+            ("11013", "Q3"),
+            ("11014", "Q4")
+        ]
+    else:
+        print("[INCREMENTAL MODE] Collecting current quarter only")
+        years = [str(current_year)]
+        if current_month <= 3:
+            quarters = [("11011", "Q1")]
+        elif current_month <= 6:
+            quarters = [("11012", "Q2")]
+        elif current_month <= 9:
+            quarters = [("11013", "Q3")]
+        else:
+            quarters = [("11014", "Q4")]
     
     batch = []
+    api_call_count = 0
     
     for ticker, corp_code in corp_map.items():
         for year in years:
-            for q_code, q_name in quarters.items():
+            for q_code, q_name in quarters:
+                # API 제한 체크
+                if api_call_count >= MAX_DAILY_CALLS:
+                    print(f"\n[LIMIT] Reached daily API limit ({MAX_DAILY_CALLS})")
+                    print(f"[INFO] Progress saved. Run again tomorrow to continue.")
+                    if batch:
+                        ws.append_rows(batch, value_input_option="RAW")
+                        print(f"[OK] Final batch uploaded: {len(batch)} rows")
+                    return
+                
                 key = (ticker, year, q_name)
                 if key in existing:
                     continue
                 
+                api_call_count += 1
                 fin = fetch_financials(corp_code, year, q_code)
+                
                 if not fin:
                     continue
                 
@@ -184,22 +210,31 @@ def collect_financials():
                 ]
                 
                 batch.append(row)
+                existing.add(key)  # 메모리에도 추가 (중복 방지)
                 
                 # 100개씩 배치 업로드
                 if len(batch) >= 100:
                     ws.append_rows(batch, value_input_option="RAW")
-                    print(f"[OK] Uploaded {len(batch)} rows for {ticker}")
+                    print(f"[OK] Uploaded batch (API calls: {api_call_count}/{MAX_DAILY_CALLS})")
                     batch.clear()
                 
-                time.sleep(0.05)  # API 호출 제한 (초당 20회)
+                time.sleep(0.05)  # API 제한 (초당 20회)
         
-        time.sleep(0.1)  # 종목당 약간의 딜레이
+        # 진행 상황 출력 (100개 종목마다)
+        if api_call_count % 400 == 0:
+            print(f"[PROGRESS] {api_call_count}/{MAX_DAILY_CALLS} API calls used")
     
     # 남은 데이터 업로드
     if batch:
         ws.append_rows(batch, value_input_option="RAW")
         print(f"[OK] Final upload: {len(batch)} rows")
+    
+    print(f"\n[COMPLETE] Total API calls: {api_call_count}")
+    if is_initial and api_call_count >= MAX_DAILY_CALLS:
+        print("[INFO] Initial collection incomplete. Will resume tomorrow.")
+    else:
+        print("[INFO] Collection finished successfully.")
 
 if __name__ == "__main__":
     collect_financials()
-    print("DONE - Financial statements collected")
+    print("DONE")
