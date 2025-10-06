@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
 FIN_SHEET = "fin_statement"
-MAX_DAILY_CALLS = 9500
+MAX_DAILY_CALLS = 30000
 
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
