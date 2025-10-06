@@ -1,8 +1,8 @@
 name: run-collector-daily
 on:
   schedule:
-    - cron: '0 13 * * *'   # 매일 22:00 JST (UTC 13:00)
-  workflow_dispatch: {}     # 수동 실행 버튼
+    - cron: '0 16 * * *'   # 매일 01:00 JST (UTC 16:00)
+  workflow_dispatch: {}
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -20,7 +20,6 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SLEEP_SEC: '0.5'
       
-      # ✅ 재무제표 수집 추가
       - name: Run financial collector (OpenDart)
         run: python collector_dart.py
         env:
