@@ -178,9 +178,13 @@ def collect_financials():
     batch = []
     api_calls = 0
     new_records = 0
+    loop_count = 0
     last_print = time.time()
     
     for ticker, corp_code in corp_map.items():
+        loop_count += 1
+        if loop_count % 500 == 0:
+            print(f"[LOOP] {loop_count} iterations | API: {api_calls} | Saved: {new_records}", flush=True)
         for year in years:
             for q_code, q_name in quarters:
                 if api_calls >= MAX_DAILY_CALLS:
