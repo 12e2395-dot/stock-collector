@@ -1,25 +1,28 @@
 name: run-collector-daily
-
 on:
   schedule:
     - cron: '0 13 * * *'   # 매일 22:00 JST (UTC 13:00)
   workflow_dispatch: {}     # 수동 실행 버튼
-
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - run: pip install -r requirements.txt
-
-      - name: Run collector
+      
+      - name: Run daily collector (PyKRX)
         run: python collector_v1.py
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SLEEP_SEC: '0.5'
+      
+      # ✅ 재무제표 수집 추가
+      - name: Run financial collector (OpenDart)
+        run: python collector_dart.py
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
