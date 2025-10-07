@@ -146,69 +146,74 @@ def get_corp_code_map():
         return {}
 
 # --------- 재무 데이터 조회 ---------
-def fetch_financials(corp_code, year, quarter_code):
+def fetch_financials(corp_code, year, reprt_code):
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-    result = {
-        "매출액": "",
-        "영업이익": "",
-        "당기순이익": "",
-        "자기자본": "",
-        "부채총계": "",
-        "자산총계": ""
-    }
-
     ACCOUNT_MAP = {
+        # 매출
         "ifrs-full_Revenue": "매출액",
+        "ifrs_Revenue": "매출액",
         "dart_Revenue": "매출액",
+        "dart_SalesRevenue": "매출액",
+        "ifrs-full_Sales": "매출액",
+        # 영업이익
         "dart_OperatingIncomeLoss": "영업이익",
+        "ifrs-full_OperatingIncomeLoss": "영업이익",
+        # 당기순이익
         "ifrs-full_ProfitLoss": "당기순이익",
+        "dart_NetIncomeLoss": "당기순이익",
+        "ifrs-full_ProfitLossAttributableToOwnersOfParent": "당기순이익",
+        # 재무상태표
         "ifrs-full_Assets": "자산총계",
         "ifrs-full_Liabilities": "부채총계",
         "ifrs-full_Equity": "자기자본",
+        "ifrs-full_EquityAttributableToOwnersOfParent": "자기자본"
     }
 
-    for fs_div in ["CFS", "OFS"]:  # 연결/별도 재무제표 순서대로
+    NAME_MAP = {
+        "매출액": "매출액", "매출": "매출액",
+        "영업이익": "영업이익", "영업이익(손실)": "영업이익",
+        "당기순이익": "당기순이익", "분기순이익": "당기순이익",
+        "자산총계": "자산총계", "자산": "자산총계",
+        "부채총계": "부채총계", "부채": "부채총계",
+        "자기자본": "자기자본", "자본총계": "자기자본",
+    }
+
+    for fs_div in ("CFS", "OFS"):
         params = {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
             "bsns_year": year,
-            "reprt_code": quarter_code,
+            "reprt_code": reprt_code,
             "fs_div": fs_div,
         }
-
         resp = _get_with_retry(url, params)
         if not resp:
             continue
-
-        try:
-            data = resp.json()
-        except Exception:
-            continue
-
+        data = resp.json()
         if data.get("status") != "000":
             continue
 
-        items = data.get("list", [])
-        if not items:
-            continue
-
-        for item in items:
-            account_id = item.get("account_id") or item.get("account_cd")
-            value = (item.get("thstrm_amount") or "").replace(",", "").strip()
-            if not account_id or not value:
+        items = data.get("list") or []
+        out = {k: "" for k in ["매출액","영업이익","당기순이익","자산총계","부채총계","자기자본"]}
+        for it in items:
+            aid = it.get("account_id") or it.get("account_cd") or ""
+            anm = it.get("account_nm", "").strip()
+            val = it.get("thstrm_amount")
+            try:
+                val = int(str(val).replace(",","").strip())
+            except:
                 continue
 
-            if account_id in ACCOUNT_MAP:
-                try:
-                    result[ACCOUNT_MAP[account_id]] = int(value)
-                except ValueError:
-                    continue
+            key = ACCOUNT_MAP.get(aid) or NAME_MAP.get(anm)
+            if key and out[key] == "":
+                out[key] = val
 
-        # CFS가 성공하면 바로 반환
-        if any(result.values()):
-            return result
+        if any(out.values()):
+            out["_fs_div"] = fs_div
+            return out
 
-    return result
+    return {k: "" for k in ["매출액","영업이익","당기순이익","자산총계","부채총계","자기자본"]}
+
 
 
 # --------- 메인 수집 ---------
