@@ -6,23 +6,52 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      group: dart-collector
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
+      - run: |
+          pip install -r requirements.txt
+          pip install google-auth
+
+      # 체크포인트 복원(어제 이어서)
+      - name: Restore checkpoint
+        uses: actions/cache@v4
+        with:
+          path: dart_checkpoint.json
+          key: dart-checkpoint-${{ github.ref_name }}
+          restore-keys: |
+            dart-checkpoint-
 
       - name: Run daily collector (PyKRX)
-        run: python collector_v1.py
+        run: python -u collector_v1.py
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SLEEP_SEC: '0.5'
 
       - name: Run financial collector (OpenDart)
-        run: python collector_dart.py
+        run: python -u collector_dart.py
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          MAX_DAILY_CALLS: '30000'   # 본수집
+          SAMPLE_TICKERS: '0'        # 전체
+          FS_DIV_ONLY_CFS: '1'       # 빠르게(연결만). 필요 시 '0'으로 바꿔 별도 런에서 OFS 보강
+
+      # 체크포인트 저장(내일 이어서)
+      - name: Save checkpoint
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: dart_checkpoint.json
+          key: dart-checkpoint-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            dart-checkpoint-${{ github.ref_name }}
+            dart-checkpoint-
