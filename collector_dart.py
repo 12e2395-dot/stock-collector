@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 os.environ['PYTHONUNBUFFERED'] = '1'
 
-DART_API_KEY = "3639678c518e2b0da39794089538e1613dd00003"
+DART_API_KEY = "2577b83cd4832faf40689fb65ad1c51e34a1bfb3"
 FIN_SHEET = "fin_statement"
 MAX_DAILY_CALLS = 28000
 MAX_WORKERS = 6
