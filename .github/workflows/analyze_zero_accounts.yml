@@ -1,11 +1,14 @@
 name: Analyze Zero Accounts
-
 on:
   workflow_dispatch:
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # ↓↓↓ 시크릿을 환경변수로 주입
+    env:
+      SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
 
     steps:
       - name: Checkout repository
@@ -20,6 +23,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # (디버그) 환경변수 존재 확인
+      - name: Check env presence
+        run: |
+          if [ -z "$SERVICE_ACCOUNT_JSON" ]; then echo "❌ SERVICE_ACCOUNT_JSON missing"; exit 1; fi
+          if [ -z "$SHEET_ID" ]; then echo "❌ SHEET_ID missing"; exit 1; fi
+          echo "✅ Env vars present. SHEET_ID length: ${#SHEET_ID}"
 
       - name: Run analysis script
         run: python extract_zero_corps.py
