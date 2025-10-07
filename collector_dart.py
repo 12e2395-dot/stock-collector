@@ -147,6 +147,7 @@ def get_corp_code_map():
 
 # --------- 재무 데이터 조회 ---------
 def fetch_financials(corp_code, year, quarter_code):
+    """재무제표 조회 - 개선된 매칭"""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
     
     for fs_div in ["CFS", "OFS"]:
@@ -175,28 +176,67 @@ def fetch_financials(corp_code, year, quarter_code):
             continue
         
         result = {}
+        
         for item in items:
             account = item.get("account_nm", "")
-            value = item.get("thstrm_amount", "0").replace(",", "")
+            sj_div = item.get("sj_div", "")
+            value = item.get("thstrm_amount", "")
+            
+            # 빈값 처리
+            if not value or value == "":
+                continue
+            
+            # 쉼표 제거
+            value = value.replace(",", "").strip()
             
             try:
-                value = int(value) if value else 0
+                value = int(value)
             except:
-                value = 0
+                continue
             
-            if "매출액" in account and "매출액" not in result:
-                result["매출액"] = value
-            elif "영업이익" in account and "영업이익" not in result:
-                result["영업이익"] = value
-            elif "당기순이익" in account and "당기순이익" not in result:
-                result["당기순이익"] = value
-            elif "자본총계" in account or "자기자본" in account:
-                result["자기자본"] = value
-            elif "부채총계" in account:
-                result["부채총계"] = value
-            elif "자산총계" in account:
-                result["자산총계"] = value
+            # === CIS (포괄손익계산서) ===
+            if sj_div == "CIS":
+                # 매출
+                if "매출액" not in result:
+                    if account in ["매출", "매출액"]:
+                        result["매출액"] = value
+                
+                # 영업이익
+                if "영업이익" not in result:
+                    if account in ["영업이익(손실)", "영업이익", "영업손익"]:
+                        result["영업이익"] = value
+                
+                # 당기순이익 (지배기업 우선)
+                if "당기순이익" not in result:
+                    # 1순위: 지배기업 귀속
+                    if "지배기업의 소유주에게 귀속되는" in account and "순이익" in account:
+                        result["당기순이익"] = value
+                    # 2순위: 일반 순이익
+                    elif account in [
+                        "당기순이익(손실)", "당기순이익",
+                        "분기순이익(손실)", "분기순이익",
+                        "반기순이익(손실)", "반기순이익"
+                    ]:
+                        result["당기순이익"] = value
+            
+            # === BS (재무상태표) ===
+            elif sj_div == "BS":
+                # 자기자본 (띄어쓰기 처리)
+                if "자기자본" not in result:
+                    if account in ["자본총계", "자본 총계", "자본"]:
+                        result["자기자본"] = value
+                
+                # 부채총계 (띄어쓰기 처리)
+                if "부채총계" not in result:
+                    if account in ["부채총계", "부채 총계", "부채"]:
+                        result["부채총계"] = value
+                
+                # 자산총계 (띄어쓰기 처리)
+                if "자산총계" not in result:
+                    if account in ["자산총계", "자산 총계", "자산"]:
+                        result["자산총계"] = value
         
+        # 결과가 있으면 반환
         if result:
             return result
     
