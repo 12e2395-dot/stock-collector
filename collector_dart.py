@@ -16,6 +16,11 @@ TIMEOUT = 8
 CHECKPOINT_FILE = "dart_checkpoint.json"
 TREAT_OPERATING_REVENUE_AS_SALES = True  # 금융업 대응
 
+# GitHub Actions 환경 변수 반영
+MAX_DAILY_CALLS = int(os.getenv("MAX_DAILY_CALLS", MAX_DAILY_CALLS))
+SAMPLE_TICKERS = int(os.getenv("SAMPLE_TICKERS", "0"))  # 0이면 전체 종목
+FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "0") == "1"
+
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
