@@ -5,8 +5,7 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # ↓↓↓ 시크릿을 환경변수로 주입
-    env:
+    env:                               # ✅ 시크릿 → 환경변수 매핑
       SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
       SHEET_ID: ${{ secrets.SHEET_ID }}
 
@@ -24,12 +23,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # (디버그) 환경변수 존재 확인
-      - name: Check env presence
+      - name: Check env presence (debug)
         run: |
-          if [ -z "$SERVICE_ACCOUNT_JSON" ]; then echo "❌ SERVICE_ACCOUNT_JSON missing"; exit 1; fi
-          if [ -z "$SHEET_ID" ]; then echo "❌ SHEET_ID missing"; exit 1; fi
-          echo "✅ Env vars present. SHEET_ID length: ${#SHEET_ID}"
+          test -n "$SERVICE_ACCOUNT_JSON" || (echo "❌ SERVICE_ACCOUNT_JSON missing" && exit 1)
+          test -n "$SHEET_ID" || (echo "❌ SHEET_ID missing" && exit 1)
+          echo "✅ Env OK. SHEET_ID length: ${#SHEET_ID}"
 
       - name: Run analysis script
         run: python extract_zero_corps.py
