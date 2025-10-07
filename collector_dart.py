@@ -265,9 +265,20 @@ def collect_financials():
         ws.insert_row(header, 1)
     
     print("[STEP 2/7] Loading existing...", flush=True)
-    all_vals = ws.get_all_values()
-    existing = {(r[0], r[2], r[3]) for r in all_vals[1:]} if len(all_vals) > 1 else set()
-    print(f"  → {len(existing)} existing records", flush=True)
+all_vals = ws_fin.get_all_values()
+
+# 값도 함께 저장 (당기순이익 기준으로 0 체크)
+existing_data = {}
+if len(all_vals) > 1:
+    for r in all_vals[1:]:
+        if len(r) >= 8:
+            key = (r[0], r[2], r[3])  # (ticker, year, quarter)
+            net_income = r[7] if len(r) > 7 else "0"  # 당기순이익 컬럼
+            existing_data[key] = net_income
+else:
+    existing_data = {}
+
+print(f"  → {len(existing_data)} existing records", flush=True)
     
     print("[STEP 3/7] Getting corp_codes...", flush=True)
     corp_map = get_corp_code_map()
@@ -309,13 +320,23 @@ def collect_financials():
         ]
     
     print("[STEP 5/7] Building tasks...", flush=True)
-    tasks = []
-    for ticker, corp_code in corp_map.items():
-        for year in years:
-            for q_code, q_name in quarters:
-                key = (ticker, year, q_name)
-                if key in existing:
-                    continue
+tasks = []
+for ticker, corp_code in corp_map.items():
+    for year in years:
+        for q_code, q_name in quarters:
+            key = (ticker, year, q_name)
+            
+            # existing에 없거나, 있어도 0이면 재수집
+            should_collect = False
+            
+            if key not in existing_data:
+                should_collect = True
+            else:
+                existing_value = existing_data[key].strip()
+                if existing_value == "0" or existing_value == "":
+                    should_collect = True
+            
+            if should_collect:
                 tasks.append((ticker, corp_code, year, q_code, q_name))
     
     total = len(tasks)
