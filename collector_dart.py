@@ -217,20 +217,96 @@ def collect_financials():
         ws = sheet.worksheet(FIN_SHEET)
     except:
         ws = sheet.add_worksheet(title=FIN_SHEET, rows=10, cols=15)
-    if ws.row_values(1)[:1] != ["ticker"]:
-        ws.insert_row(["ticker","corp_code","year","quarter","date","매출액","영업이익","당기순이익","자기자본","부채총계","자산총계"], 1)
 
+    # 헤더 확인
+    if ws.row_values(1)[:1] != ["ticker"]:
+        ws.insert_row(
+            ["ticker", "corp_code", "year", "quarter", "date",
+             "매출액", "영업이익", "당기순이익",
+             "자기자본", "부채총계", "자산총계"], 1)
+
+    # 1️⃣ DART corpCode 로드
     corp_map = get_corp_code_map()
+
+    # 2️⃣ PyKRX 상장사 기준으로 필터링
+    try:
+        from pykrx import stock
+        listed = set(stock.get_market_ticker_list(market="KOSPI") +
+                     stock.get_market_ticker_list(market="KOSDAQ"))
+        before = len(corp_map)
+        corp_map = {k: v for k, v in corp_map.items() if k in listed}
+        print(f"[FILTER] Listed only: {len(corp_map)} / {before}")
+    except Exception as e:
+        print(f"[WARN] Failed to filter listed stocks: {e}")
+
+    # 3️⃣ 수집할 연도/분기 설정
     current_year = datetime.now().year
-    years = [str(current_year-1), str(current_year)]
-    quarters = [("11013","Q1"),("11012","H1"),("11014","Q3"),("11011","ANNUAL")]
-    tasks = [(t,c,y,rc,qn) for t,c in corp_map.items() for y in years for rc,qn in quarters]
+    years = [str(current_year - 1), str(current_year)]
+    quarters = [
+        ("11013", "Q1"), ("11012", "H1"),
+        ("11014", "Q3"), ("11011", "ANNUAL")
+    ]
+
+    # 4️⃣ TASKS 생성
+    tasks = [(t, c, y, rc, qn)
+             for t, c in corp_map.items()
+             for y in years
+             for rc, qn in quarters]
     print(f"[TASKS] {len(tasks)}")
 
+    # 5️⃣ 체크포인트 불러오기
     done = load_checkpoint()
     acc = {}
     api_calls = 0
     done_today = set()
+
+    # 6️⃣ 워커 함수
+    def worker(task):
+        nonlocal api_calls
+        ticker, corp_code, year, reprt_code, q_name = task
+        key = f"{ticker}-{year}-{q_name}"
+
+        # 이미 완료된 항목 또는 API 한도 초과 시 건너뜀
+        if key in done or api_calls >= MAX_DAILY_CALLS:
+            return None
+
+        fin = fetch_financials(corp_code, year, reprt_code)
+        api_calls += 1
+        done_today.add(key)
+        return (ticker, corp_code, year, q_name, fin)
+
+    # 7️⃣ 병렬 실행
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for res in ex.map(worker, tasks):
+            if api_calls >= MAX_DAILY_CALLS:
+                print(f"[LIMIT] Hit {MAX_DAILY_CALLS}, saving checkpoint and exiting.")
+                break
+            if res:
+                ticker, corp_code, year, q_name, fin = res
+                acc.setdefault((ticker, year), {"corp_code": corp_code}).update({q_name: fin})
+
+    # 8️⃣ 체크포인트 저장
+    save_checkpoint(done.union(done_today))
+
+    # 9️⃣ 분기 단품 계산 및 시트 저장
+    print("[STEP] Calculating quarter singles...")
+    rows = []
+    for (ticker, year), s in acc.items():
+        corp_code = s.get("corp_code", "")
+        singles = make_quarter_single(s)
+        for q in ["Q1", "Q2", "Q3", "Q4"]:
+            fin = singles[q]
+            rows.append([
+                ticker, corp_code, year, q, f"{year}-{q}",
+                fin["매출액"], fin["영업이익"], fin["당기순이익"],
+                fin["자기자본"], fin["부채총계"], fin["자산총계"]
+            ])
+
+    if rows:
+        append_rows_safe(ws, rows, "quarter-singles")
+
+    print(f"[DONE] {len(rows)} rows saved | API calls today: {api_calls}")
+
 
     def worker(task):
         nonlocal api_calls
