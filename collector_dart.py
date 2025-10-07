@@ -1,4 +1,4 @@
-# collector_dart.py — 최종 확정판 (원본 데이터 보존)
+# collector_dart.py — 최종 확정판 (0 재수집 기능 추가)
 
 import os, sys, time, tempfile, zipfile, io, threading
 import requests
@@ -182,11 +182,9 @@ def fetch_financials(corp_code, year, quarter_code):
             sj_div = item.get("sj_div", "")
             value = item.get("thstrm_amount", "")
             
-            # 빈값 처리
             if not value or value == "":
                 continue
             
-            # 쉼표 제거
             value = value.replace(",", "").strip()
             
             try:
@@ -194,24 +192,19 @@ def fetch_financials(corp_code, year, quarter_code):
             except:
                 continue
             
-            # === CIS (포괄손익계산서) ===
+            # CIS (포괄손익계산서)
             if sj_div == "CIS":
-                # 매출
                 if "매출액" not in result:
                     if account in ["매출", "매출액"]:
                         result["매출액"] = value
                 
-                # 영업이익
                 if "영업이익" not in result:
                     if account in ["영업이익(손실)", "영업이익", "영업손익"]:
                         result["영업이익"] = value
                 
-                # 당기순이익 (지배기업 우선)
                 if "당기순이익" not in result:
-                    # 1순위: 지배기업 귀속
                     if "지배기업의 소유주에게 귀속되는" in account and "순이익" in account:
                         result["당기순이익"] = value
-                    # 2순위: 일반 순이익
                     elif account in [
                         "당기순이익(손실)", "당기순이익",
                         "분기순이익(손실)", "분기순이익",
@@ -219,24 +212,20 @@ def fetch_financials(corp_code, year, quarter_code):
                     ]:
                         result["당기순이익"] = value
             
-            # === BS (재무상태표) ===
+            # BS (재무상태표)
             elif sj_div == "BS":
-                # 자기자본 (띄어쓰기 처리)
                 if "자기자본" not in result:
                     if account in ["자본총계", "자본 총계", "자본"]:
                         result["자기자본"] = value
                 
-                # 부채총계 (띄어쓰기 처리)
                 if "부채총계" not in result:
                     if account in ["부채총계", "부채 총계", "부채"]:
                         result["부채총계"] = value
                 
-                # 자산총계 (띄어쓰기 처리)
                 if "자산총계" not in result:
                     if account in ["자산총계", "자산 총계", "자산"]:
                         result["자산총계"] = value
         
-        # 결과가 있으면 반환
         if result:
             return result
     
@@ -265,20 +254,18 @@ def collect_financials():
         ws.insert_row(header, 1)
     
     print("[STEP 2/7] Loading existing...", flush=True)
-all_vals = ws_fin.get_all_values()
-
-# 값도 함께 저장 (당기순이익 기준으로 0 체크)
-existing_data = {}
-if len(all_vals) > 1:
-    for r in all_vals[1:]:
-        if len(r) >= 8:
-            key = (r[0], r[2], r[3])  # (ticker, year, quarter)
-            net_income = r[7] if len(r) > 7 else "0"  # 당기순이익 컬럼
-            existing_data[key] = net_income
-else:
+    all_vals = ws.get_all_values()
+    
+    # 값도 함께 저장 (당기순이익 기준으로 0 체크)
     existing_data = {}
-
-print(f"  → {len(existing_data)} existing records", flush=True)
+    if len(all_vals) > 1:
+        for r in all_vals[1:]:
+            if len(r) >= 8:
+                key = (r[0], r[2], r[3])
+                net_income = r[7] if len(r) > 7 else "0"
+                existing_data[key] = net_income
+    
+    print(f"  → {len(existing_data)} existing records", flush=True)
     
     print("[STEP 3/7] Getting corp_codes...", flush=True)
     corp_map = get_corp_code_map()
@@ -295,19 +282,18 @@ print(f"  → {len(existing_data)} existing records", flush=True)
         print("[WARN] Could not filter, using all corp_codes", flush=True)
     
     current_year = datetime.now().year
-    
     required_years = {str(current_year - 1), str(current_year)}
     existing_years = {r[2] for r in all_vals[1:]} if len(all_vals) > 1 else set()
-    is_initial = not required_years.issubset(existing_years) or len(existing) < 10000
+    is_initial = not required_years.issubset(existing_years) or len(existing_data) < 10000
     
     if is_initial:
-        print(f"[MODE] INITIAL", flush=True)
+        print("[MODE] INITIAL", flush=True)
         years = [str(current_year - 1), str(current_year)]
         quarters = [
-            ("11013", "Q1"),      # 1분기보고서
-            ("11012", "H1"),      # 반기보고서 (누적)
-            ("11014", "Q3"),      # 3분기보고서 (누적)
-            ("11011", "ANNUAL"),  # 사업보고서 (연간)
+            ("11013", "Q1"),
+            ("11012", "H1"),
+            ("11014", "Q3"),
+            ("11011", "ANNUAL"),
         ]
     else:
         print("[MODE] INCREMENTAL", flush=True)
@@ -320,24 +306,22 @@ print(f"  → {len(existing_data)} existing records", flush=True)
         ]
     
     print("[STEP 5/7] Building tasks...", flush=True)
-tasks = []
-for ticker, corp_code in corp_map.items():
-    for year in years:
-        for q_code, q_name in quarters:
-            key = (ticker, year, q_name)
-            
-            # existing에 없거나, 있어도 0이면 재수집
-            should_collect = False
-            
-            if key not in existing_data:
-                should_collect = True
-            else:
-                existing_value = existing_data[key].strip()
-                if existing_value == "0" or existing_value == "":
+    tasks = []
+    for ticker, corp_code in corp_map.items():
+        for year in years:
+            for q_code, q_name in quarters:
+                key = (ticker, year, q_name)
+                
+                should_collect = False
+                if key not in existing_data:
                     should_collect = True
-            
-            if should_collect:
-                tasks.append((ticker, corp_code, year, q_code, q_name))
+                else:
+                    existing_value = existing_data[key].strip()
+                    if existing_value == "0" or existing_value == "":
+                        should_collect = True
+                
+                if should_collect:
+                    tasks.append((ticker, corp_code, year, q_code, q_name))
     
     total = len(tasks)
     print(f"  → {total} tasks pending", flush=True)
