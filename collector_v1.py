@@ -221,3 +221,18 @@ def collect_and_upload():
 
 if __name__ == "__main__":
     collect_and_upload()
+
+def probe(corp_code, year, reprt_code, fs_div="CFS"):
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    p = {"crtfc_key": DART_API_KEY, "corp_code": corp_code, "bsns_year": year,
+         "reprt_code": reprt_code, "fs_div": fs_div}
+    r = _get_with_retry(url, p)
+    if not r:
+        print("[probe] http fail"); return
+    data = r.json()
+    print("[probe] status:", data.get("status"), data.get("message"))
+    items = data.get("list") or []
+    print(f"[probe] items: {len(items)}")
+    for it in items[:10]:  # 상위 10개만
+        print("  -", it.get("sj_div"), it.get("account_id") or it.get("account_cd"),
+              "|", it.get("account_nm"), "|", it.get("thstrm_amount"))
