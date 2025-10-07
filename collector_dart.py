@@ -147,89 +147,69 @@ def get_corp_code_map():
 
 # --------- 재무 데이터 조회 ---------
 def fetch_financials(corp_code, year, quarter_code):
-    """재무제표 조회 - 개선된 매칭"""
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-    
-    for fs_div in ["CFS", "OFS"]:
+    result = {
+        "매출액": "",
+        "영업이익": "",
+        "당기순이익": "",
+        "자기자본": "",
+        "부채총계": "",
+        "자산총계": ""
+    }
+
+    ACCOUNT_MAP = {
+        "ifrs-full_Revenue": "매출액",
+        "dart_Revenue": "매출액",
+        "dart_OperatingIncomeLoss": "영업이익",
+        "ifrs-full_ProfitLoss": "당기순이익",
+        "ifrs-full_Assets": "자산총계",
+        "ifrs-full_Liabilities": "부채총계",
+        "ifrs-full_Equity": "자기자본",
+    }
+
+    for fs_div in ["CFS", "OFS"]:  # 연결/별도 재무제표 순서대로
         params = {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
             "bsns_year": year,
             "reprt_code": quarter_code,
-            "fs_div": fs_div
+            "fs_div": fs_div,
         }
-        
+
         resp = _get_with_retry(url, params)
         if not resp:
             continue
-        
+
         try:
             data = resp.json()
-        except:
+        except Exception:
             continue
-        
+
         if data.get("status") != "000":
             continue
-        
+
         items = data.get("list", [])
         if not items:
             continue
-        
-        result = {}
-        
+
         for item in items:
-            account = item.get("account_nm", "")
-            sj_div = item.get("sj_div", "")
-            value = item.get("thstrm_amount", "")
-            
-            if not value or value == "":
+            account_id = item.get("account_id") or item.get("account_cd")
+            value = (item.get("thstrm_amount") or "").replace(",", "").strip()
+            if not account_id or not value:
                 continue
-            
-            value = value.replace(",", "").strip()
-            
-            try:
-                value = int(value)
-            except:
-                continue
-            
-            # CIS (포괄손익계산서)
-            if sj_div == "CIS":
-                if "매출액" not in result:
-                    if account in ["매출", "매출액"]:
-                        result["매출액"] = value
-                
-                if "영업이익" not in result:
-                    if account in ["영업이익(손실)", "영업이익", "영업손익"]:
-                        result["영업이익"] = value
-                
-                if "당기순이익" not in result:
-                    if "지배기업의 소유주에게 귀속되는" in account and "순이익" in account:
-                        result["당기순이익"] = value
-                    elif account in [
-                        "당기순이익(손실)", "당기순이익",
-                        "분기순이익(손실)", "분기순이익",
-                        "반기순이익(손실)", "반기순이익"
-                    ]:
-                        result["당기순이익"] = value
-            
-            # BS (재무상태표)
-            elif sj_div == "BS":
-                if "자기자본" not in result:
-                    if account in ["자본총계", "자본 총계", "자본"]:
-                        result["자기자본"] = value
-                
-                if "부채총계" not in result:
-                    if account in ["부채총계", "부채 총계", "부채"]:
-                        result["부채총계"] = value
-                
-                if "자산총계" not in result:
-                    if account in ["자산총계", "자산 총계", "자산"]:
-                        result["자산총계"] = value
-        
-        if result:
+
+            if account_id in ACCOUNT_MAP:
+                try:
+                    result[ACCOUNT_MAP[account_id]] = int(value)
+                except ValueError:
+                    continue
+
+        # CFS가 성공하면 바로 반환
+        if any(result.values()):
             return result
-    
-    return None
+
+    return result
+
 
 # --------- 메인 수집 ---------
 def collect_financials():
