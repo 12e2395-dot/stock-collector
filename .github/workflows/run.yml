@@ -29,7 +29,7 @@ jobs:
           pip install -r requirements.txt
           pip install google-auth
 
-      # 체크포인트 복원(전날 이어서). 수동실행+reset=true면 곧바로 삭제되니 괜찮음
+      # 체크포인트 복원(전날 이어서)
       - name: Restore checkpoint
         uses: actions/cache@v4
         with:
@@ -38,10 +38,15 @@ jobs:
           restore-keys: |
             dart-checkpoint-
 
-      # 수동 실행 때만 체크포인트 강제 삭제 (시트 비웠을 때 필수)
-      - name: Reset DART checkpoint (manual only)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset }}
+      # ✅ 지금은 '항상' 리셋 (시트 비웠으니 풀빌드)
+      #   나중에 이어달리기 원하면 이 스텝을 주석 처리하거나 아래 조건부(수동 실행 시에만)로 바꾸세요.
+      - name: Reset DART checkpoint (always for full rebuild)
         run: rm -f dart_checkpoint.json || true
+
+      # (선택) 수동 실행에서만 리셋하고 싶을 때 사용
+      # - name: Reset DART checkpoint (manual only)
+      #   if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset }}
+      #   run: rm -f dart_checkpoint.json || true
 
       - name: Run daily collector (PyKRX)
         run: python -u collector_v1.py
@@ -62,7 +67,7 @@ jobs:
           FS_DIV_ONLY_CFS: '1'               # 연결 먼저 (빠름)
           TREAT_OPERATING_REVENUE_AS_SALES: '1'  # 금융업 대응
           RUN_REPAIR_ZERO: '0'               # 시트 비었으니 OFF (콜 절약)
-          # YEARS: '2024,2025'               # 원하면 범위 고정
+          # YEARS: '2024,2025'               # 필요 시 범위 고정
 
       # 체크포인트 저장(내일 이어서)
       - name: Save checkpoint
