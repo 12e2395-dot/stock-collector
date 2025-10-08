@@ -1,8 +1,15 @@
 name: run-collector-daily
+
 on:
   schedule:
     - cron: '0 16 * * *'   # 매일 01:00 JST (UTC 16:00)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      reset:
+        description: 'Delete checkpoint before run? (use when sheet is empty/full rebuild)'
+        type: boolean
+        default: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -10,16 +17,19 @@ jobs:
     concurrency:
       group: dart-collector
       cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: |
           pip install -r requirements.txt
           pip install google-auth
 
-      # 체크포인트 복원(어제 이어서)
+      # 체크포인트 복원(전날 이어서). 수동실행+reset=true면 곧바로 삭제되니 괜찮음
       - name: Restore checkpoint
         uses: actions/cache@v4
         with:
@@ -27,6 +37,11 @@ jobs:
           key: dart-checkpoint-${{ github.ref_name }}
           restore-keys: |
             dart-checkpoint-
+
+      # 수동 실행 때만 체크포인트 강제 삭제 (시트 비웠을 때 필수)
+      - name: Reset DART checkpoint (manual only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset }}
+        run: rm -f dart_checkpoint.json || true
 
       - name: Run daily collector (PyKRX)
         run: python -u collector_v1.py
@@ -41,9 +56,13 @@ jobs:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
-          MAX_DAILY_CALLS: '30000'   # 본수집
-          SAMPLE_TICKERS: '0'        # 전체
-          FS_DIV_ONLY_CFS: '1'       # 빠르게(연결만). 필요 시 '0'으로 바꿔 별도 런에서 OFS 보강
+          # === 실행 파라미터 ===
+          MAX_DAILY_CALLS: '30000'
+          SAMPLE_TICKERS: '0'                # 전체
+          FS_DIV_ONLY_CFS: '1'               # 연결 먼저 (빠름)
+          TREAT_OPERATING_REVENUE_AS_SALES: '1'  # 금융업 대응
+          RUN_REPAIR_ZERO: '0'               # 시트 비었으니 OFF (콜 절약)
+          # YEARS: '2024,2025'               # 원하면 범위 고정
 
       # 체크포인트 저장(내일 이어서)
       - name: Save checkpoint
