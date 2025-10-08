@@ -1,7 +1,9 @@
+# collector_dart.py  —  FINAL (2025-10-08)
 import os, sys, time, tempfile, zipfile, io, threading, json, re
 import requests, gspread
 from datetime import datetime
 import xml.etree.ElementTree as ET
+from zipfile import BadZipFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
@@ -19,6 +21,8 @@ FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "1") == "1"
 YEARS_ENV = os.getenv("YEARS", "")
 RUN_REPAIR_ZERO = os.getenv("RUN_REPAIR_ZERO", "1") == "1"
 DEBUG_TICKER = os.getenv("DEBUG_TICKER", "")
+SAMPLE_TICKERS = int(os.getenv("SAMPLE_TICKERS", "0"))
+SKIP_IF_EXISTS = os.getenv("SKIP_IF_EXISTS", "1") == "1"
 
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
@@ -27,7 +31,11 @@ SHEET_ID = os.environ.get("SHEET_ID")
 # HTTP + RateLimiter
 # =========================
 _session = requests.Session()
-_session.headers.update({"User-Agent": "dart-collector/4.1", "Connection": "keep-alive"})
+_session.headers.update({
+    "User-Agent": "dart-collector/4.2",
+    "Connection": "keep-alive",
+    "Accept": "*/*"
+})
 
 _token_lock = threading.Lock()
 _tokens = DART_RPS
@@ -54,14 +62,12 @@ def _get_with_retry(url, params, max_retry=3):
             resp = _session.get(url, params=params, timeout=TIMEOUT)
             if resp.status_code == 200:
                 return resp
-            elif resp.status_code == 429:
-                print(f"[WARN] Rate limit hit, retry {attempt+1}/{max_retry}", flush=True)
+            if resp.status_code in (429, 500, 502, 503):
+                time.sleep(backoff); backoff *= 2; continue
         except requests.Timeout:
-            print(f"[WARN] Timeout, retry {attempt+1}/{max_retry}", flush=True)
-        except Exception as e:
-            print(f"[WARN] Request error: {e}, retry {attempt+1}/{max_retry}", flush=True)
-        time.sleep(backoff)
-        backoff *= 2
+            time.sleep(backoff); backoff *= 2; continue
+        except Exception:
+            time.sleep(backoff); backoff *= 2; continue
     return None
 
 # =========================
@@ -110,55 +116,93 @@ def load_checkpoint():
         return set()
 
 # =========================
-# corpCode Map (+ 상장필터)  ← [가드 강화]
+# 시트에서 corp_map 폴백 생성
 # =========================
-def get_corp_code_map():
+def corp_map_from_sheet(ws):
+    vals = ws.get_all_values()
+    if not vals or len(vals) < 2:
+        return {}
+    header = vals[0]
+    try:
+        it = header.index("ticker")
+        ic = header.index("corp_code")
+    except ValueError:
+        return {}
+    out = {}
+    for row in vals[1:]:
+        if len(row) <= max(it, ic): continue
+        t = row[it].strip(); c = row[ic].strip()
+        if len(t) == 6 and c:
+            out[t] = c
+    if out:
+        print(f"[FALLBACK] corp_map from sheet: {len(out)}", flush=True)
+    return out
+
+# =========================
+# corpCode Map (+ 상장필터, 강건화)
+# =========================
+def get_corp_code_map(ws):
     if not DART_API_KEY:
-        raise RuntimeError("DART_API_KEY is not set. Please check your environment variables.")
+        m = corp_map_from_sheet(ws)
+        if m:
+            print("[WARN] DART_API_KEY missing — using sheet mapping.", flush=True)
+            return m
+        raise RuntimeError("DART_API_KEY is not set and sheet has no corp_code mapping.")
 
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    resp = _session.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
-    if not resp:
-        raise RuntimeError("corpCode request failed (no response)")
-    if resp.status_code != 200:
-        preview = resp.text[:200] if hasattr(resp, "text") else str(resp.content[:200])
-        raise RuntimeError(f"corpCode HTTP {resp.status_code}: {preview}")
 
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    is_zip_ct = "zip" in ct or "application/octet-stream" in ct
-    is_pk_sig = resp.content[:2] == b"PK"
-    if not (is_zip_ct and is_pk_sig):
-        # 에러 응답인 경우 내용 출력
+    # 몇 번은 그냥 재시도 (ZIP 직접 파싱)
+    last_err = None
+    for attempt in range(4):
         try:
-            error_data = resp.json()
-            raise RuntimeError(f"DART API Error (corpCode): {error_data}")
-        except Exception:
-            preview = resp.text[:300] if hasattr(resp, "text") else str(resp.content[:300])
-            raise RuntimeError(f"DART corpCode non-zip response. Check API key/limit. CT={ct} Preview={preview}")
+            resp = _session.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
+            if not resp or resp.status_code != 200:
+                last_err = f"HTTP {getattr(resp,'status_code',None)}"
+                time.sleep(0.5 * (2 ** attempt)); continue
 
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        xml_data = z.read(z.namelist()[0])
-    root = ET.fromstring(xml_data)
-    mapping = {}
-    for item in root.findall("list"):
-        corp_code = (item.findtext("corp_code") or "").strip()
-        stock_code = (item.findtext("stock_code") or "").strip()
-        if stock_code and len(stock_code) == 6:
-            mapping[stock_code] = corp_code
-    print(f"[corpCode] Loaded {len(mapping)} companies", flush=True)
+            # 바로 ZIP 시도
+            try:
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                    xml_data = z.read(z.namelist()[0])
+                root = ET.fromstring(xml_data)
+                mapping = {}
+                for item in root.findall("list"):
+                    corp_code = (item.findtext("corp_code") or "").strip()
+                    stock_code = (item.findtext("stock_code") or "").strip()
+                    if stock_code and len(stock_code) == 6:
+                        mapping[stock_code] = corp_code
+                print(f"[corpCode] Loaded {len(mapping)} companies", flush=True)
+                # PyKRX 상장사 필터
+                try:
+                    from pykrx import stock
+                    listed = set(stock.get_market_ticker_list(market="KOSPI") +
+                                 stock.get_market_ticker_list(market="KOSDAQ"))
+                    before = len(mapping)
+                    mapping = {k: v for k, v in mapping.items() if k in listed}
+                    print(f"[FILTER] Listed only: {len(mapping)} / {before}", flush=True)
+                except Exception as e:
+                    print(f"[WARN] PyKRX filter failed: {e}", flush=True)
+                return mapping
+            except BadZipFile as e:
+                # 진짜 ZIP이 아니면 JSON 에러 메시지 시도
+                try:
+                    j = resp.json()
+                    last_err = f"DART says: {j}"
+                except Exception:
+                    ct = resp.headers.get("Content-Type")
+                    preview = resp.content[:200]
+                    last_err = f"Non-zip & non-json. CT={ct} Preview={preview!r}"
+                time.sleep(0.5 * (2 ** attempt)); continue
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.5 * (2 ** attempt)); continue
 
-    # PyKRX 상장사로 필터
-    try:
-        from pykrx import stock
-        listed = set(stock.get_market_ticker_list(market="KOSPI") +
-                     stock.get_market_ticker_list(market="KOSDAQ"))
-        before = len(mapping)
-        mapping = {k: v for k, v in mapping.items() if k in listed}
-        print(f"[FILTER] Listed only: {len(mapping)} / {before}", flush=True)
-    except Exception as e:
-        print(f"[WARN] PyKRX filter failed: {e}", flush=True)
-
-    return mapping
+    # 여기까지 왔으면 API쪽 문제 — 시트 폴백 사용
+    m = corp_map_from_sheet(ws)
+    if m:
+        print(f"[WARN] corpCode API failed after retries — using sheet mapping. ({last_err})", flush=True)
+        return m
+    raise RuntimeError(f"corpCode failed: {last_err}")
 
 # =========================
 # 매핑 규칙 (ID/이름)
@@ -198,26 +242,23 @@ def _pick_by_id_or_name(items, id_set, name_re, used):
     # id 우선
     for it in items:
         aid = (it.get("account_id") or it.get("account_cd") or "").strip()
-        if aid and aid in id_set and f"id:{aid}" not in used:
+        if aid and (aid in id_set) and (f"id:{aid}" not in used):
             val = _parse_amount(it.get("thstrm_amount"))
             if val is not None:
                 return val, f"id:{aid}"
     # 이름 보조
     for it in items:
         nm = (it.get("account_nm") or "").strip()
-        if name_re.search(nm) and f"nm:{nm}" not in used:
+        if name_re.search(nm) and (f"nm:{nm}" not in used):
             val = _parse_amount(it.get("thstrm_amount"))
             if val is not None:
                 return val, f"nm:{nm}"
     return None, None
 
 # =========================
-# DART 조회 (수정: 호출 횟수 반환)
+# DART 조회 (호출 수 반환)
 # =========================
 def fetch_financials(corp_code, year, reprt_code, ticker=None):
-    """
-    반환값: (재무데이터 dict, API 호출 횟수)
-    """
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
     calls_made = 0
 
@@ -231,8 +272,7 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
             "fs_div": fs_div,
         }
         resp = _get_with_retry(url, params)
-        calls_made += 1  # API 호출 카운트
-
+        calls_made += 1
         if not resp:
             return None
         try:
@@ -268,11 +308,9 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
             "자산총계": at, "부채총계": li, "자기자본": eq
         }
 
-    # 1) CFS
     out = _one("CFS")
     core_missing = (not out) or all(out.get(k) is None for k in ("매출액","영업이익","당기순이익"))
 
-    # 2) 필요할 때만 OFS 폴백
     if core_missing and (not FS_DIV_ONLY_CFS or (ticker and ticker.startswith("900"))):
         alt = _one("OFS")
         if alt:
@@ -313,46 +351,38 @@ def make_quarter_single(series):
 # 작업 빌드
 # =========================
 def build_tasks(corp_map, years, quarters):
-    return [(t, c, y, rc, qn) for t, c in corp_map.items() for y in years for rc, qn in quarters]
+    items = list(corp_map.items())
+    if SAMPLE_TICKERS > 0:
+        items = items[:SAMPLE_TICKERS]
+        print(f"[SAMPLE] limiting to {len(items)} tickers", flush=True)
+    return [(t, c, y, rc, qn) for t, c in items for y in years for rc, qn in quarters]
 
 # =========================
-# 기존 데이터 로드 (중복 방지용)
+# 기존 데이터 로드 (중복/스킵)
 # =========================
 def load_existing_data(ws):
-    """
-    시트에서 기존 데이터를 로드하여 (ticker, year, quarter) 세트 반환
-    """
     try:
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
             return set(), {}
-        
         header = all_vals[0]
         try:
             idx_ticker = header.index("ticker")
             idx_year = header.index("year")
             idx_quarter = header.index("quarter")
-            idx_corp = header.index("corp_code")
         except ValueError:
             return set(), {}
-        
         existing = set()
-        row_map = {}  # (ticker, year, quarter) -> row_index
-        
+        row_map = {}
         for rno, row in enumerate(all_vals[1:], start=2):
-            if len(row) <= max(idx_ticker, idx_year, idx_quarter):
-                continue
-            try:
-                tic = row[idx_ticker].strip()
-                yr = row[idx_year].strip()
-                q = row[idx_quarter].strip()
-                if tic and yr and q:
-                    key = (tic, yr, q)
-                    existing.add(key)
-                    row_map[key] = rno
-            except:
-                continue
-        
+            if len(row) <= max(idx_ticker, idx_year, idx_quarter): continue
+            tic = (row[idx_ticker] or "").strip()
+            yr  = (row[idx_year] or "").strip()
+            q   = (row[idx_quarter] or "").strip()
+            if tic and yr and q:
+                key = (tic, yr, q)
+                existing.add(key)
+                row_map[key] = rno
         print(f"[EXISTING] Loaded {len(existing)} existing records", flush=True)
         return existing, row_map
     except Exception as e:
@@ -360,7 +390,7 @@ def load_existing_data(ws):
         return set(), {}
 
 # =========================
-# 기존 시트 0/빈칸 자동 수정 (API 호출 카운트 정확)
+# 기존 시트 0/빈칸 자동 수정
 # =========================
 def repair_zero_rows(ws, corp_map, years, api_calls_left):
     print("[REPAIR] start scanning sheet zeros", flush=True)
@@ -376,7 +406,6 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
         print("[REPAIR] header mismatch; skip", flush=True)
         return 0, api_calls_left
 
-    # (ticker,year) -> row_index(by quarter)
     pos = {}
     for rno, row in enumerate(all_vals[1:], start=2):
         try:
@@ -389,19 +418,18 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
             continue
         pos.setdefault((tic, yr), {})[q] = rno
 
-    # "수정 대상" 선정
     targets = set()
     for (tic, yr), qrows in pos.items():
         for q in ("Q1","Q2","Q3","Q4"):
             rno = qrows.get(q)
-            if not rno: 
+            if not rno:
                 targets.add((tic, yr)); break
             row = all_vals[rno-1]
             mv = row[idx["매출액"]]; ov = row[idx["영업이익"]]; nv = row[idx["당기순이익"]]
-            def _is_zeroish(x):
+            def _zeroish(x):
                 sx = str(x).strip()
                 return sx == "" or sx == "0" or sx == "0.0"
-            if _is_zeroish(mv) or _is_zeroish(ov) or _is_zeroish(nv):
+            if _zeroish(mv) or _zeroish(ov) or _zeroish(nv):
                 targets.add((tic, yr)); break
 
     if not targets:
@@ -409,7 +437,6 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
         return 0, api_calls_left
 
     print(f"[REPAIR] candidates: {len(targets)}", flush=True)
-
     reprts = [("11013","Q1"),("11012","H1"),("11014","Q3"),("11011","ANNUAL")]
     fixed = 0
     total_calls_used = 0
@@ -418,22 +445,20 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
         if api_calls_left - total_calls_used <= 0:
             print("[REPAIR] hit call limit during repair", flush=True)
             break
-        
+
         corp_code = None
         any_q = pos[(tic,yr)].get("Q1") or pos[(tic,yr)].get("Q2") or pos[(tic,yr)].get("Q3") or pos[(tic,yr)].get("Q4")
         if any_q:
             row = all_vals[any_q-1]
-            corp_code = row[idx["corp_code"]].strip() if idx.get("corp_code") is not None else None
+            corp_code = row[idx.get("corp_code", -1)].strip() if idx.get("corp_code") is not None else None
         if not corp_code:
             corp_code = corp_map.get(tic)
-
         if not corp_code:
             continue
 
         series = {}
         for rc, qn in reprts:
-            if api_calls_left - total_calls_used <= 0:
-                break
+            if api_calls_left - total_calls_used <= 0: break
             out, calls = fetch_financials(corp_code, yr, rc, ticker=tic)
             total_calls_used += calls
             series[qn] = out
@@ -441,15 +466,12 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
         singles = make_quarter_single(series)
         for q in ("Q1","Q2","Q3","Q4"):
             rno = pos[(tic,yr)].get(q)
-            if not rno:
-                continue
+            if not rno: continue
             fin = singles.get(q, {})
             def _cell(v): return "" if v is None else v
-            new_row = [
-                tic, corp_code, yr, q, f"{yr}-{q}",
-                _cell(fin.get("매출액")), _cell(fin.get("영업이익")), _cell(fin.get("당기순이익")),
-                _cell(fin.get("자기자본")), _cell(fin.get("부채총계")), _cell(fin.get("자산총계"))
-            ]
+            new_row = [tic, corp_code, yr, q, f"{yr}-{q}",
+                       _cell(fin.get("매출액")), _cell(fin.get("영업이익")), _cell(fin.get("당기순이익")),
+                       _cell(fin.get("자기자본")), _cell(fin.get("부채총계")), _cell(fin.get("자산총계"))]
             update_row_safe(ws, rno, new_row)
             fixed += 1
 
@@ -458,7 +480,7 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
     return fixed, api_calls_left
 
 # =========================
-# 메인 수집 (중복 방지 + API 카운트 정확 + 예약 최적화)
+# 메인 수집
 # =========================
 def collect_financials():
     sheet = open_sheet()
@@ -472,12 +494,10 @@ def collect_financials():
             ["ticker","corp_code","year","quarter","date",
              "매출액","영업이익","당기순이익","자기자본","부채총계","자산총계"], 1)
 
-    # 기존 데이터 로드
     existing_data, row_map = load_existing_data(ws)
 
-    corp_map = get_corp_code_map()
+    corp_map = get_corp_code_map(ws)
 
-    # 연도 결정
     current_year = datetime.now().year
     if YEARS_ENV.strip():
         years = [y.strip() for y in YEARS_ENV.split(",") if y.strip()]
@@ -488,7 +508,6 @@ def collect_financials():
     tasks = build_tasks(corp_map, years, quarters)
     print(f"[TASKS] {len(tasks)}", flush=True)
 
-    # 기존 0/빈칸 행 우선 수정
     api_calls_left = MAX_DAILY_CALLS
     if RUN_REPAIR_ZERO:
         fixed, api_calls_left = repair_zero_rows(ws, corp_map, set(years), api_calls_left)
@@ -497,11 +516,9 @@ def collect_financials():
     done = load_checkpoint()
     acc = {}
     done_today = set()
-
     api_calls_lock = threading.Lock()
-    
+
     def take_calls(n):
-        """n개의 API 호출 여유가 있는지 확인하고 차감"""
         nonlocal api_calls_left
         with api_calls_lock:
             if api_calls_left < n:
@@ -512,18 +529,19 @@ def collect_financials():
     def worker(task):
         ticker, corp_code, year, reprt_code, q_name = task
         key = f"{ticker}-{year}-{q_name}"
+
         if key in done:
             return None
+        if SKIP_IF_EXISTS and (ticker, year, q_name) in existing_data:
+            # 이미 존재하면 스킵 (호출 절약)
+            return None
 
-        # [예약 최적화] CFS만 시도할 가능성이 높은 케이스는 1콜만 예약
-        reserve = 1 if (FS_DIV_ONLY_CFS and not (ticker and ticker.startswith("900"))) else 2
-        if not take_calls(reserve):
+        # 최대 2회 (CFS + OFS) 여유 예약
+        if not take_calls(2):
             return "LIMIT"
 
         fin, calls_made = fetch_financials(corp_code, year, reprt_code, ticker=ticker)
-
-        # 실제 사용분만 확정, 미사용 예약분 환급
-        unused = reserve - calls_made
+        unused = 2 - calls_made
         if unused > 0:
             with api_calls_lock:
                 api_calls_left += unused
@@ -531,7 +549,6 @@ def collect_financials():
         done_today.add(key)
         return (ticker, corp_code, year, q_name, fin)
 
-    # 병렬 수집
     completed = 0
     total = len(tasks)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -553,10 +570,8 @@ def collect_financials():
                 print("[LIMIT] Hit MAX_DAILY_CALLS (approx). Saving checkpoint.", flush=True)
                 break
 
-    # 체크포인트 저장
     save_checkpoint(done.union(done_today))
 
-    # 단품 계산 후 저장 (중복 필터링)
     print("[STEP] Calculating quarter singles...", flush=True)
     rows = []
     def _cell(v): return "" if v is None else v
@@ -565,15 +580,12 @@ def collect_financials():
         corp_code = s.get("corp_code","")
         singles = make_quarter_single(s)
         for q in ("Q1","Q2","Q3","Q4"):
-            # 중복 체크
             if (ticker, year, q) in existing_data:
                 if DEBUG_TICKER and ticker == DEBUG_TICKER:
                     print(f"[SKIP] Duplicate: {ticker}-{year}-{q}", flush=True)
                 continue
-            
             fin = singles.get(q, {})
             core = [fin.get("매출액"), fin.get("영업이익"), fin.get("당기순이익")]
-            # 핵심 모두 결측이면 행 생략
             if all(v is None for v in core):
                 continue
             rows.append([
