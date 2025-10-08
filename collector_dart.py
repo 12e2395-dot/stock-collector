@@ -1,3 +1,6 @@
+- name: Reset DART checkpoint
+  run: rm -f dart_checkpoint.json || true
+
 # collector_dart.py  —  FINAL (2025-10-08)
 import os, sys, time, tempfile, zipfile, io, threading, json, re
 import requests, gspread
