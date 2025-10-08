@@ -110,26 +110,32 @@ def load_checkpoint():
         return set()
 
 # =========================
-# corpCode Map (+ 상장필터)
+# corpCode Map (+ 상장필터)  ← [가드 강화]
 # =========================
 def get_corp_code_map():
     if not DART_API_KEY:
         raise RuntimeError("DART_API_KEY is not set. Please check your environment variables.")
-    
+
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     resp = _session.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
-    if not resp or resp.status_code != 200:
-        raise RuntimeError(f"corpCode HTTP {getattr(resp,'status_code',None)}")
-    
-    # ZIP 파일인지 확인
-    if not resp.content.startswith(b'PK'):
+    if not resp:
+        raise RuntimeError("corpCode request failed (no response)")
+    if resp.status_code != 200:
+        preview = resp.text[:200] if hasattr(resp, "text") else str(resp.content[:200])
+        raise RuntimeError(f"corpCode HTTP {resp.status_code}: {preview}")
+
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    is_zip_ct = "zip" in ct or "application/octet-stream" in ct
+    is_pk_sig = resp.content[:2] == b"PK"
+    if not (is_zip_ct and is_pk_sig):
         # 에러 응답인 경우 내용 출력
         try:
             error_data = resp.json()
-            raise RuntimeError(f"DART API Error: {error_data}")
-        except:
-            raise RuntimeError(f"DART API returned non-zip content. Check your API key. Content preview: {resp.content[:200]}")
-    
+            raise RuntimeError(f"DART API Error (corpCode): {error_data}")
+        except Exception:
+            preview = resp.text[:300] if hasattr(resp, "text") else str(resp.content[:300])
+            raise RuntimeError(f"DART corpCode non-zip response. Check API key/limit. CT={ct} Preview={preview}")
+
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
         xml_data = z.read(z.namelist()[0])
     root = ET.fromstring(xml_data)
@@ -226,7 +232,7 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
         }
         resp = _get_with_retry(url, params)
         calls_made += 1  # API 호출 카운트
-        
+
         if not resp:
             return None
         try:
@@ -242,7 +248,9 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
         used = set()
         revenue, rk = _pick_by_id_or_name(items, REVENUE_IDS, REV_NAME_RE, used)
         if revenue is None and TREAT_OPERATING_REVENUE_AS_SALES:
-            revenue, rk = _pick_by_id_or_name(items, set(), re.compile(r"(영업수익|이자수익|보험료수익|수수료수익)", re.I), used)
+            revenue, rk = _pick_by_id_or_name(
+                items, set(), re.compile(r"(영업수익|이자수익|보험료수익|수수료수익)", re.I), used
+            )
         if rk: used.add(rk)
 
         op, ok = _pick_by_id_or_name(items, OPERATING_INCOME_IDS, OP_NAME_RE, used);  used.add(ok or "")
@@ -352,7 +360,7 @@ def load_existing_data(ws):
         return set(), {}
 
 # =========================
-# 기존 시트 0/빈칸 자동 수정 (수정: API 호출 카운트 정확히 반영)
+# 기존 시트 0/빈칸 자동 수정 (API 호출 카운트 정확)
 # =========================
 def repair_zero_rows(ws, corp_map, years, api_calls_left):
     print("[REPAIR] start scanning sheet zeros", flush=True)
@@ -450,7 +458,7 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
     return fixed, api_calls_left
 
 # =========================
-# 메인 수집 (수정: 중복 방지 + API 카운트 정확)
+# 메인 수집 (중복 방지 + API 카운트 정확 + 예약 최적화)
 # =========================
 def collect_financials():
     sheet = open_sheet()
@@ -506,19 +514,20 @@ def collect_financials():
         key = f"{ticker}-{year}-{q_name}"
         if key in done:
             return None
-        
-        # 최대 2회 호출 가능성 대비 (CFS + OFS)
-        if not take_calls(2):
+
+        # [예약 최적화] CFS만 시도할 가능성이 높은 케이스는 1콜만 예약
+        reserve = 1 if (FS_DIV_ONLY_CFS and not (ticker and ticker.startswith("900"))) else 2
+        if not take_calls(reserve):
             return "LIMIT"
-        
+
         fin, calls_made = fetch_financials(corp_code, year, reprt_code, ticker=ticker)
-        
-        # 실제 사용한 만큼만 차감했으므로, 남은 건 반환
-        unused = 2 - calls_made
+
+        # 실제 사용분만 확정, 미사용 예약분 환급
+        unused = reserve - calls_made
         if unused > 0:
             with api_calls_lock:
                 api_calls_left += unused
-        
+
         done_today.add(key)
         return (ticker, corp_code, year, q_name, fin)
 
@@ -547,7 +556,7 @@ def collect_financials():
     # 체크포인트 저장
     save_checkpoint(done.union(done_today))
 
-    # 단품 계산 후 저장 (중복 필터링 추가)
+    # 단품 계산 후 저장 (중복 필터링)
     print("[STEP] Calculating quarter singles...", flush=True)
     rows = []
     def _cell(v): return "" if v is None else v
