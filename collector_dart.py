@@ -4,31 +4,31 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ===============================================
-# CONFIG
-# ===============================================
-DART_API_KEY = "2577b83cd4832faf40689fb65ad1c51e34a1bfb3"   # 🔸 반드시 본인 키로 교체
-FIN_SHEET = "fin_statement_quarter"
-MAX_DAILY_CALLS = 30000
-MAX_WORKERS = 6
-DART_RPS = 4.0
-TIMEOUT = 8
-CHECKPOINT_FILE = "dart_checkpoint.json"
-TREAT_OPERATING_REVENUE_AS_SALES = True  # 금융업 대응
-
-# GitHub Actions 환경 변수 반영
-MAX_DAILY_CALLS = int(os.getenv("MAX_DAILY_CALLS", MAX_DAILY_CALLS))
-SAMPLE_TICKERS = int(os.getenv("SAMPLE_TICKERS", "0"))  # 0이면 전체 종목
-FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "0") == "1"
+# =========================
+# CONFIG (env로 오버라이드 가능)
+# =========================
+DART_API_KEY = os.getenv("3639678c518e2b0da39794089538e1613dd00003", "")  # 반드시 GitHub Secret로 주입
+FIN_SHEET = os.getenv("FIN_SHEET", "fin_statement_quarter")
+MAX_DAILY_CALLS = int(os.getenv("MAX_DAILY_CALLS", "30000"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
+DART_RPS = float(os.getenv("DART_RPS", "4.0"))
+TIMEOUT = int(os.getenv("TIMEOUT", "8"))
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "dart_checkpoint.json")
+TREAT_OPERATING_REVENUE_AS_SALES = os.getenv("TREAT_OPERATING_REVENUE_AS_SALES", "1") == "1"
+FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "1") == "1"   # 기본 CFS, 필요시 OFS 폴백
+YEARS_ENV = os.getenv("YEARS", "")  # "2024,2025" or "", 빈값이면 (올해-1, 올해)
+RUN_REPAIR_ZERO = os.getenv("RUN_REPAIR_ZERO", "1") == "1"   # 기존 0/빈칸 행 스캔 후 수정
+DEBUG_TICKER = os.getenv("DEBUG_TICKER", "")                 # 특정 티커 디버그 로그
 
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 
-# ===============================================
+# =========================
 # HTTP + RateLimiter
-# ===============================================
+# =========================
 _session = requests.Session()
-_session.headers.update({"User-Agent": "dart-collector/3.0"})
+_session.headers.update({"User-Agent": "dart-collector/4.0", "Connection": "keep-alive"})
+
 _token_lock = threading.Lock()
 _tokens = DART_RPS
 _last_refill = time.time()
@@ -60,12 +60,12 @@ def _get_with_retry(url, params, max_retry=3):
         backoff *= 2
     return None
 
-# ===============================================
-# Google Sheet
-# ===============================================
+# =========================
+# Google Sheet IO
+# =========================
 def open_sheet():
     if not SERVICE_ACCOUNT_JSON or not SHEET_ID:
-        raise RuntimeError("ENV missing")
+        raise RuntimeError("ENV missing: SERVICE_ACCOUNT_JSON / SHEET_ID")
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fp:
         fp.write(SERVICE_ACCOUNT_JSON)
         sa_path = fp.name
@@ -73,46 +73,72 @@ def open_sheet():
     return gc.open_by_key(SHEET_ID)
 
 _write_lock = threading.Lock()
+
 def append_rows_safe(ws, rows, tag=""):
     if not rows: return
     with _write_lock:
         ws.append_rows(rows, value_input_option="RAW")
     print(f"[SAVE] {len(rows)} rows ({tag})", flush=True)
 
-# ===============================================
-# Checkpoint 기능
-# ===============================================
+def update_row_safe(ws, row_idx, row_values):
+    rng = f"A{row_idx}:K{row_idx}"
+    with _write_lock:
+        ws.update(rng, [row_values], value_input_option="RAW")
+
+# =========================
+# Checkpoint
+# =========================
 def save_checkpoint(done_list):
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(done_list), f)
+    try:
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(done_list), f)
+    except Exception as e:
+        print(f"[WARN] save_checkpoint failed: {e}", flush=True)
 
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
         return set()
-    with open(CHECKPOINT_FILE, encoding="utf-8") as f:
-        return set(json.load(f))
+    try:
+        with open(CHECKPOINT_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except:
+        return set()
 
-# ===============================================
-# corpCode Map
-# ===============================================
+# =========================
+# corpCode Map (+ 상장필터)
+# =========================
 def get_corp_code_map():
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     resp = _session.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
+    if not resp or resp.status_code != 200:
+        raise RuntimeError(f"corpCode HTTP {getattr(resp,'status_code',None)}")
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
         xml_data = z.read(z.namelist()[0])
     root = ET.fromstring(xml_data)
     mapping = {}
     for item in root.findall("list"):
-        corp_code = item.findtext("corp_code", "").strip()
-        stock_code = item.findtext("stock_code", "").strip()
+        corp_code = (item.findtext("corp_code") or "").strip()
+        stock_code = (item.findtext("stock_code") or "").strip()
         if stock_code and len(stock_code) == 6:
             mapping[stock_code] = corp_code
-    print(f"[corpCode] Loaded {len(mapping)} companies")
+    print(f"[corpCode] Loaded {len(mapping)} companies", flush=True)
+
+    # PyKRX 상장사로 필터
+    try:
+        from pykrx import stock
+        listed = set(stock.get_market_ticker_list(market="KOSPI") +
+                     stock.get_market_ticker_list(market="KOSDAQ"))
+        before = len(mapping)
+        mapping = {k: v for k, v in mapping.items() if k in listed}
+        print(f"[FILTER] Listed only: {len(mapping)} / {before}", flush=True)
+    except Exception as e:
+        print(f"[WARN] PyKRX filter failed: {e}", flush=True)
+
     return mapping
 
-# ===============================================
-# 재무 데이터 매핑
-# ===============================================
+# =========================
+# 매핑 규칙 (ID/이름)
+# =========================
 REVENUE_IDS = {
     "ifrs-full_Revenue","ifrs_Revenue","dart_Revenue","dart_SalesRevenue",
     "ifrs-full_RevenueFromContractsWithCustomers","ifrs_RevenueFromContractsWithCustomers"
@@ -125,9 +151,13 @@ ASSETS_IDS = {"ifrs-full_Assets"}
 LIAB_IDS = {"ifrs-full_Liabilities"}
 EQUITY_IDS = {"ifrs-full_Equity","ifrs-full_EquityAttributableToOwnersOfParent"}
 
-REV_NAME_RE = re.compile(r"(매\s*출|매출액|영업수익|상품매출|제품매출)", re.I)
+# 매출 후보(금융/수수료형 보강)
+REV_NAME_RE = re.compile(
+    r"(매\s*출|매출액|영업수익|상품매출|제품매출|수수료수익|이자수익|보험료수익|수익\(영업\))",
+    re.I
+)
 OP_NAME_RE  = re.compile(r"(영업\s*이익|영업이익\(손실\)|영업손실)", re.I)
-NI_NAME_RE  = re.compile(r"(당기\s*순\s*이익|분기\s*순\s*이익|당기순손익)", re.I)
+NI_NAME_RE  = re.compile(r"(당기\s*순\s*이익|분기\s*순\s*이익|당기순손익|지배주주지분순이익)", re.I)
 AS_NAME_RE  = re.compile(r"(자산\s*총계|자산$)", re.I)
 LI_NAME_RE  = re.compile(r"(부채\s*총계|부채$)", re.I)
 EQ_NAME_RE  = re.compile(r"(자기\s*자본|자본\s*총계|지배기업의소유주지분)", re.I)
@@ -136,25 +166,36 @@ def _parse_amount(v):
     if v is None: return None
     s = str(v).replace(",", "").strip()
     if s in {"", "-", "–"}: return None
-    try: return int(float(s))
-    except: return None
+    try:
+        # DART는 '원' 단위가 기본. 숫자는 그대로 유지(시트에서 E+11 표시는 서식 문제)
+        return int(float(s))
+    except:
+        return None
 
 def _pick_by_id_or_name(items, id_set, name_re, used):
+    # id 우선
     for it in items:
         aid = (it.get("account_id") or it.get("account_cd") or "").strip()
         if aid and aid in id_set and f"id:{aid}" not in used:
             val = _parse_amount(it.get("thstrm_amount"))
-            if val is not None: return val, f"id:{aid}"
+            if val is not None:
+                return val, f"id:{aid}"
+    # 이름 보조
     for it in items:
         nm = (it.get("account_nm") or "").strip()
         if name_re.search(nm) and f"nm:{nm}" not in used:
             val = _parse_amount(it.get("thstrm_amount"))
-            if val is not None: return val, f"nm:{nm}"
+            if val is not None:
+                return val, f"nm:{nm}"
     return None, None
 
-def fetch_financials(corp_code, year, reprt_code):
+# =========================
+# DART 조회 (CFS 우선, 핵심값 없으면 OFS 폴백)
+# =========================
+def fetch_financials(corp_code, year, reprt_code, ticker=None):
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-    for fs_div in ("CFS", "OFS"):
+
+    def _one(fs_div):
         params = {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
@@ -163,37 +204,65 @@ def fetch_financials(corp_code, year, reprt_code):
             "fs_div": fs_div,
         }
         resp = _get_with_retry(url, params)
-        if not resp: continue
-        data = resp.json()
-        if data.get("status") != "000": continue
+        if not resp:
+            return None
+        try:
+            data = resp.json()
+        except:
+            return None
+        if data.get("status") != "000":
+            return None
         items = data.get("list") or []
-        if not items: continue
+        if not items:
+            return None
 
         used = set()
         revenue, rk = _pick_by_id_or_name(items, REVENUE_IDS, REV_NAME_RE, used)
         if revenue is None and TREAT_OPERATING_REVENUE_AS_SALES:
-            revenue, rk = _pick_by_id_or_name(items, set(), re.compile(r"(영업수익|이자수익|보험료수익)", re.I), used)
+            revenue, rk = _pick_by_id_or_name(items, set(), re.compile(r"(영업수익|이자수익|보험료수익|수수료수익)", re.I), used)
         if rk: used.add(rk)
+
         op, ok = _pick_by_id_or_name(items, OPERATING_INCOME_IDS, OP_NAME_RE, used);  used.add(ok or "")
         ni, nk = _pick_by_id_or_name(items, NET_INCOME_IDS, NI_NAME_RE, used);         used.add(nk or "")
         at, ak = _pick_by_id_or_name(items, ASSETS_IDS, AS_NAME_RE, used);             used.add(ak or "")
         li, lk = _pick_by_id_or_name(items, LIAB_IDS, LI_NAME_RE, used);               used.add(lk or "")
         eq, ek = _pick_by_id_or_name(items, EQUITY_IDS, EQ_NAME_RE, used);             used.add(ek or "")
 
-        return {
-            "매출액": revenue or 0, "영업이익": op or 0, "당기순이익": ni or 0,
-            "자산총계": at or 0, "부채총계": li or 0, "자기자본": eq or 0
-        }
-    return {"매출액":0,"영업이익":0,"당기순이익":0,"자산총계":0,"부채총계":0,"자기자본":0}
+        if ticker and ticker == DEBUG_TICKER:
+            print(f"[DBG] {ticker} y={year} rc={reprt_code} fs={fs_div} "
+                  f"rev={revenue} op={op} ni={ni} at={at} li={li} eq={eq}", flush=True)
 
-# ===============================================
-# 분기 단품 계산
-# ===============================================
-def _v(d, key): return int(d.get(key, 0) or 0)
-def _sub(a,b): return max(0,a-b)
+        return {
+            "매출액": revenue, "영업이익": op, "당기순이익": ni,
+            "자산총계": at, "부채총계": li, "자기자본": eq
+        }
+
+    # 1) CFS
+    out = _one("CFS")
+    core_missing = (not out) or all(out.get(k) is None for k in ("매출액","영업이익","당기순이익"))
+
+    # 2) 필요할 때만 OFS 폴백
+    if core_missing and (not FS_DIV_ONLY_CFS or (ticker and ticker.startswith("900"))):
+        alt = _one("OFS")
+        if alt:
+            out = alt
+
+    return out or {"매출액":None,"영업이익":None,"당기순이익":None,"자산총계":None,"부채총계":None,"자기자본":None}
+
+# =========================
+# 분기 단품 계산 (음수 허용, 결측은 None 유지)
+# =========================
+def _v(d, key):
+    if not isinstance(d, dict): return None
+    v = d.get(key, None)
+    return v if (isinstance(v, (int,float)) or v is None) else None
+
+def _sub(a, b):
+    if a is None or b is None: return None
+    return a - b  # 음수 허용
 
 def make_quarter_single(series):
-    Q1, H1, Q3, AN = [series.get(x,{}) for x in ("Q1","H1","Q3","ANNUAL")]
+    Q1, H1, Q3, AN = [series.get(x, {}) for x in ("Q1","H1","Q3","ANNUAL")]
     return {
         "Q1": {"매출액":_v(Q1,"매출액"), "영업이익":_v(Q1,"영업이익"), "당기순이익":_v(Q1,"당기순이익"),
                "자기자본":_v(Q1,"자기자본"), "부채총계":_v(Q1,"부채총계"), "자산총계":_v(Q1,"자산총계")},
@@ -208,9 +277,116 @@ def make_quarter_single(series):
                "자기자본":_v(AN,"자기자본"), "부채총계":_v(AN,"부채총계"), "자산총계":_v(AN,"자산총계")},
     }
 
-# ===============================================
-# 메인 수집 (자동 재개 포함)
-# ===============================================
+# =========================
+# 작업 빌드
+# =========================
+def build_tasks(corp_map, years, quarters):
+    return [(t, c, y, rc, qn) for t, c in corp_map.items() for y in years for rc, qn in quarters]
+
+# =========================
+# 기존 시트 0/빈칸 자동 수정
+#  - 해당 (ticker,year) 전체를 재계산하여 기존 행을 "제자리 업데이트"
+# =========================
+def repair_zero_rows(ws, corp_map, years, api_calls_left):
+    print("[REPAIR] start scanning sheet zeros", flush=True)
+    all_vals = ws.get_all_values()
+    if not all_vals or len(all_vals) < 2:
+        print("[REPAIR] no data", flush=True)
+        return 0, api_calls_left
+
+    header = all_vals[0]
+    idx = {name:i for i,name in enumerate(header)}
+    need_cols = ["ticker","corp_code","year","quarter","매출액","영업이익","당기순이익","자기자본","부채총계","자산총계"]
+    if any(col not in idx for col in need_cols):
+        print("[REPAIR] header mismatch; skip", flush=True)
+        return 0, api_calls_left
+
+    # (ticker,year) -> row_index(by quarter)
+    pos = {}
+    for rno, row in enumerate(all_vals[1:], start=2):
+        try:
+            tic = row[idx["ticker"]].strip()
+            yr  = row[idx["year"]].strip()
+            q   = row[idx["quarter"]].strip()
+        except:
+            continue
+        if not tic or not yr or q not in ("Q1","Q2","Q3","Q4"):
+            continue
+        pos.setdefault((tic, yr), {})[q] = rno
+
+    # “수정 대상” 선정: 핵심값이 0 또는 빈칸인 행이 하나라도 있는 (ticker,year)
+    targets = set()
+    for (tic, yr), qrows in pos.items():
+        for q in ("Q1","Q2","Q3","Q4"):
+            rno = qrows.get(q)
+            if not rno: 
+                targets.add((tic, yr)); break
+            row = all_vals[rno-1]
+            mv = row[idx["매출액"]]; ov = row[idx["영업이익"]]; nv = row[idx["당기순이익"]]
+            def _is_zeroish(x):
+                sx = str(x).strip()
+                return sx == "" or sx == "0" or sx == "0.0"
+            if _is_zeroish(mv) or _is_zeroish(ov) or _is_zeroish(nv):
+                targets.add((tic, yr)); break
+
+    if not targets:
+        print("[REPAIR] nothing to fix", flush=True)
+        return 0, api_calls_left
+
+    print(f"[REPAIR] candidates: {len(targets)}", flush=True)
+
+    # 재계산 (Q1/H1/Q3/AN 조회 → 단품 산출 → 기존 행 업데이트)
+    reprts = [("11013","Q1"),("11012","H1"),("11014","Q3"),("11011","ANNUAL")]
+    fixed = 0
+
+    # 간단한 레이트 리밋: 남은 콜보다 많이 쓰지 않음
+    for (tic, yr) in targets:
+        if api_calls_left <= 0:
+            print("[REPAIR] hit call limit during repair", flush=True)
+            break
+        corp_code = None
+        # 시트의 corp_code 사용 우선
+        any_q = pos[(tic,yr)].get("Q1") or pos[(tic,yr)].get("Q2") or pos[(tic,yr)].get("Q3") or pos[(tic,yr)].get("Q4")
+        if any_q:
+            row = all_vals[any_q-1]
+            corp_code = row[idx["corp_code"]].strip() if idx.get("corp_code") is not None else None
+        if not corp_code:
+            corp_code = corp_map.get(tic)
+
+        if not corp_code:
+            continue
+
+        series = {}
+        calls_used = 0
+        for rc, qn in reprts:
+            if api_calls_left - calls_used <= 0:
+                break
+            out = fetch_financials(corp_code, yr, rc, ticker=tic)
+            calls_used += 1  # CFS 1회 + (필요시) OFS 추가 1회를 더 세고 싶다면 fetch 내부에서 별도 리턴으로 바꾸세요.
+            series[qn] = out
+        api_calls_left -= calls_used
+
+        singles = make_quarter_single(series)
+        for q in ("Q1","Q2","Q3","Q4"):
+            rno = pos[(tic,yr)].get(q)
+            if not rno:
+                continue
+            fin = singles.get(q, {})
+            def _cell(v): return "" if v is None else v
+            new_row = [
+                tic, corp_code, yr, q, f"{yr}-{q}",
+                _cell(fin.get("매출액")), _cell(fin.get("영업이익")), _cell(fin.get("당기순이익")),
+                _cell(fin.get("자기자본")), _cell(fin.get("부채총계")), _cell(fin.get("자산총계"))
+            ]
+            update_row_safe(ws, rno, new_row)
+            fixed += 1
+
+    print(f"[REPAIR] updated rows: {fixed}", flush=True)
+    return fixed, api_calls_left
+
+# =========================
+# 메인 수집
+# =========================
 def collect_financials():
     sheet = open_sheet()
     try:
@@ -218,132 +394,108 @@ def collect_financials():
     except:
         ws = sheet.add_worksheet(title=FIN_SHEET, rows=10, cols=15)
 
-    # 헤더 확인
     if ws.row_values(1)[:1] != ["ticker"]:
         ws.insert_row(
-            ["ticker", "corp_code", "year", "quarter", "date",
-             "매출액", "영업이익", "당기순이익",
-             "자기자본", "부채총계", "자산총계"], 1)
+            ["ticker","corp_code","year","quarter","date",
+             "매출액","영업이익","당기순이익","자기자본","부채총계","자산총계"], 1)
 
-    # 1️⃣ DART corpCode 로드
     corp_map = get_corp_code_map()
 
-    # 2️⃣ PyKRX 상장사 기준으로 필터링
-    try:
-        from pykrx import stock
-        listed = set(stock.get_market_ticker_list(market="KOSPI") +
-                     stock.get_market_ticker_list(market="KOSDAQ"))
-        before = len(corp_map)
-        corp_map = {k: v for k, v in corp_map.items() if k in listed}
-        print(f"[FILTER] Listed only: {len(corp_map)} / {before}")
-    except Exception as e:
-        print(f"[WARN] Failed to filter listed stocks: {e}")
-
-    # 3️⃣ 수집할 연도/분기 설정
+    # 연도 결정
     current_year = datetime.now().year
-    years = [str(current_year - 1), str(current_year)]
-    quarters = [
-        ("11013", "Q1"), ("11012", "H1"),
-        ("11014", "Q3"), ("11011", "ANNUAL")
-    ]
+    if YEARS_ENV.strip():
+        years = [y.strip() for y in YEARS_ENV.split(",") if y.strip()]
+    else:
+        years = [str(current_year-1), str(current_year)]
 
-    # 4️⃣ TASKS 생성
-    tasks = [(t, c, y, rc, qn)
-             for t, c in corp_map.items()
-             for y in years
-             for rc, qn in quarters]
-    print(f"[TASKS] {len(tasks)}")
+    quarters = [("11013","Q1"),("11012","H1"),("11014","Q3"),("11011","ANNUAL")]
+    tasks = build_tasks(corp_map, years, quarters)
+    print(f"[TASKS] {len(tasks)}", flush=True)
 
-    # 5️⃣ 체크포인트 불러오기
+    # (옵션) 기존 0/빈칸 행 우선 수정
+    api_calls_left = MAX_DAILY_CALLS
+    if RUN_REPAIR_ZERO:
+        fixed, api_calls_left = repair_zero_rows(ws, corp_map, set(years), api_calls_left)
+        print(f"[INFO] repair done: fixed={fixed}, calls_left≈{api_calls_left}", flush=True)
+
     done = load_checkpoint()
     acc = {}
-    api_calls = 0
     done_today = set()
 
-    # 6️⃣ 워커 함수
+    api_calls_lock = threading.Lock()
+    def take_call():
+        nonlocal api_calls_left
+        with api_calls_lock:
+            if api_calls_left <= 0:
+                return False
+            api_calls_left -= 1
+            return True
+
     def worker(task):
-        nonlocal api_calls
         ticker, corp_code, year, reprt_code, q_name = task
         key = f"{ticker}-{year}-{q_name}"
-
-        # 이미 완료된 항목 또는 API 한도 초과 시 건너뜀
-        if key in done or api_calls >= MAX_DAILY_CALLS:
+        if key in done:
             return None
-
-        fin = fetch_financials(corp_code, year, reprt_code)
-        api_calls += 1
+        # 콜 여유 확인
+        if not take_call():
+            return "LIMIT"
+        fin = fetch_financials(corp_code, year, reprt_code, ticker=ticker)
         done_today.add(key)
         return (ticker, corp_code, year, q_name, fin)
 
-    # 7️⃣ 병렬 실행
+    # 병렬 수집
+    completed = 0
+    total = len(tasks)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for res in ex.map(worker, tasks):
-            if api_calls >= MAX_DAILY_CALLS:
-                print(f"[LIMIT] Hit {MAX_DAILY_CALLS}, saving checkpoint and exiting.")
+        futures = [ex.submit(worker, t) for t in tasks]
+        for fut in as_completed(futures):
+            res = fut.result()
+            completed += 1
+            if res == "LIMIT":
+                print("[LIMIT] Hit MAX_DAILY_CALLS (approx). Saving checkpoint.", flush=True)
                 break
-            if res:
+            if isinstance(res, tuple):
                 ticker, corp_code, year, q_name, fin = res
-                acc.setdefault((ticker, year), {"corp_code": corp_code}).update({q_name: fin})
+                acc.setdefault((ticker,year), {"corp_code":corp_code})[q_name] = fin
 
-    # 8️⃣ 체크포인트 저장
+            if completed % 1000 == 0:
+                print(f"[PROGRESS] {completed}/{total} | calls_left≈{api_calls_left}", flush=True)
+
+            if api_calls_left <= 0:
+                print("[LIMIT] Hit MAX_DAILY_CALLS (approx). Saving checkpoint.", flush=True)
+                break
+
+    # 체크포인트 저장
     save_checkpoint(done.union(done_today))
 
-    # 9️⃣ 분기 단품 계산 및 시트 저장
-    print("[STEP] Calculating quarter singles...")
+    # 단품 계산 후 저장 (빈칸/음수 허용)
+    print("[STEP] Calculating quarter singles...", flush=True)
     rows = []
-    for (ticker, year), s in acc.items():
-        corp_code = s.get("corp_code", "")
+    def _cell(v): return "" if v is None else v
+
+    for (ticker,year), s in acc.items():
+        corp_code = s.get("corp_code","")
         singles = make_quarter_single(s)
-        for q in ["Q1", "Q2", "Q3", "Q4"]:
-            fin = singles[q]
+        for q in ("Q1","Q2","Q3","Q4"):
+            fin = singles.get(q, {})
+            core = [fin.get("매출액"), fin.get("영업이익"), fin.get("당기순이익")]
+            # 핵심 모두 결측이면 행 생략(가짜 0 방지)
+            if all(v is None for v in core):
+                continue
             rows.append([
                 ticker, corp_code, year, q, f"{year}-{q}",
-                fin["매출액"], fin["영업이익"], fin["당기순이익"],
-                fin["자기자본"], fin["부채총계"], fin["자산총계"]
+                _cell(fin.get("매출액")), _cell(fin.get("영업이익")), _cell(fin.get("당기순이익")),
+                _cell(fin.get("자기자본")), _cell(fin.get("부채총계")), _cell(fin.get("자산총계"))
             ])
 
     if rows:
         append_rows_safe(ws, rows, "quarter-singles")
 
-    print(f"[DONE] {len(rows)} rows saved | API calls today: {api_calls}")
-
-
-    def worker(task):
-        nonlocal api_calls
-        ticker, corp_code, year, reprt_code, q_name = task
-        key = f"{ticker}-{year}-{q_name}"
-        if key in done or api_calls >= MAX_DAILY_CALLS:
-            return None
-        fin = fetch_financials(corp_code, year, reprt_code)
-        api_calls += 1
-        done_today.add(key)
-        return (ticker, corp_code, year, q_name, fin)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for res in ex.map(worker, tasks):
-            if api_calls >= MAX_DAILY_CALLS:
-                print(f"[LIMIT] Hit {MAX_DAILY_CALLS}, saving checkpoint and exiting.")
-                break
-            if res:
-                ticker, corp_code, year, q_name, fin = res
-                acc.setdefault((ticker,year),{"corp_code":corp_code}).update({q_name:fin})
-
-    save_checkpoint(done.union(done_today))
-
-    # Q1~Q4 계산 및 시트 저장
-    print("[STEP] Calculating quarter singles...")
-    rows = []
-    for (ticker,year), s in acc.items():
-        corp_code = s.get("corp_code","")
-        singles = make_quarter_single(s)
-        for q in ["Q1","Q2","Q3","Q4"]:
-            fin = singles[q]
-            rows.append([ticker,corp_code,year,q,f"{year}-{q}",
-                         fin["매출액"],fin["영업이익"],fin["당기순이익"],
-                         fin["자기자본"],fin["부채총계"],fin["자산총계"]])
-    if rows:
-        append_rows_safe(ws, rows, "quarter-singles")
-    print(f"[DONE] {len(rows)} rows saved | API calls today: {api_calls}")
+    print(f"[DONE] saved_rows={len(rows)} | calls_left≈{api_calls_left}", flush=True)
 
 if __name__ == "__main__":
-    collect_financials()
+    try:
+        collect_financials()
+    except Exception as e:
+        print(f"[FATAL] {e}", flush=True)
+        import traceback; traceback.print_exc()
