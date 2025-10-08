@@ -527,6 +527,7 @@ def collect_financials():
             return True
 
     def worker(task):
+        nonlocal api_calls_left  # ← 추가!
         ticker, corp_code, year, reprt_code, q_name = task
         key = f"{ticker}-{year}-{q_name}"
 
