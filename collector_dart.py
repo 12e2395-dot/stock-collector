@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 # CONFIG (env로 오버라이드 가능)
 # =========================
-DART_API_KEY = os.getenv("3639678c518e2b0da39794089538e1613dd00003", "")  # 반드시 GitHub Secret로 주입
+DART_API_KEY = os.getenv("DART_API_KEY", "")
 FIN_SHEET = os.getenv("FIN_SHEET", "fin_statement_quarter")
 MAX_DAILY_CALLS = int(os.getenv("MAX_DAILY_CALLS", "30000"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
@@ -15,10 +15,10 @@ DART_RPS = float(os.getenv("DART_RPS", "4.0"))
 TIMEOUT = int(os.getenv("TIMEOUT", "8"))
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "dart_checkpoint.json")
 TREAT_OPERATING_REVENUE_AS_SALES = os.getenv("TREAT_OPERATING_REVENUE_AS_SALES", "1") == "1"
-FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "1") == "1"   # 기본 CFS, 필요시 OFS 폴백
-YEARS_ENV = os.getenv("YEARS", "")  # "2024,2025" or "", 빈값이면 (올해-1, 올해)
-RUN_REPAIR_ZERO = os.getenv("RUN_REPAIR_ZERO", "1") == "1"   # 기존 0/빈칸 행 스캔 후 수정
-DEBUG_TICKER = os.getenv("DEBUG_TICKER", "")                 # 특정 티커 디버그 로그
+FS_DIV_ONLY_CFS = os.getenv("FS_DIV_ONLY_CFS", "1") == "1"
+YEARS_ENV = os.getenv("YEARS", "")
+RUN_REPAIR_ZERO = os.getenv("RUN_REPAIR_ZERO", "1") == "1"
+DEBUG_TICKER = os.getenv("DEBUG_TICKER", "")
 
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
@@ -27,7 +27,7 @@ SHEET_ID = os.environ.get("SHEET_ID")
 # HTTP + RateLimiter
 # =========================
 _session = requests.Session()
-_session.headers.update({"User-Agent": "dart-collector/4.0", "Connection": "keep-alive"})
+_session.headers.update({"User-Agent": "dart-collector/4.1", "Connection": "keep-alive"})
 
 _token_lock = threading.Lock()
 _tokens = DART_RPS
@@ -48,14 +48,18 @@ def _acquire_token():
 
 def _get_with_retry(url, params, max_retry=3):
     backoff = 0.5
-    for _ in range(max_retry):
+    for attempt in range(max_retry):
         _acquire_token()
         try:
             resp = _session.get(url, params=params, timeout=TIMEOUT)
             if resp.status_code == 200:
                 return resp
-        except:
-            pass
+            elif resp.status_code == 429:
+                print(f"[WARN] Rate limit hit, retry {attempt+1}/{max_retry}", flush=True)
+        except requests.Timeout:
+            print(f"[WARN] Timeout, retry {attempt+1}/{max_retry}", flush=True)
+        except Exception as e:
+            print(f"[WARN] Request error: {e}, retry {attempt+1}/{max_retry}", flush=True)
         time.sleep(backoff)
         backoff *= 2
     return None
@@ -101,17 +105,31 @@ def load_checkpoint():
     try:
         with open(CHECKPOINT_FILE, encoding="utf-8") as f:
             return set(json.load(f))
-    except:
+    except Exception as e:
+        print(f"[WARN] load_checkpoint failed: {e}, starting fresh", flush=True)
         return set()
 
 # =========================
 # corpCode Map (+ 상장필터)
 # =========================
 def get_corp_code_map():
+    if not DART_API_KEY:
+        raise RuntimeError("DART_API_KEY is not set. Please check your environment variables.")
+    
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     resp = _session.get(url, params={"crtfc_key": DART_API_KEY}, timeout=20)
     if not resp or resp.status_code != 200:
         raise RuntimeError(f"corpCode HTTP {getattr(resp,'status_code',None)}")
+    
+    # ZIP 파일인지 확인
+    if not resp.content.startswith(b'PK'):
+        # 에러 응답인 경우 내용 출력
+        try:
+            error_data = resp.json()
+            raise RuntimeError(f"DART API Error: {error_data}")
+        except:
+            raise RuntimeError(f"DART API returned non-zip content. Check your API key. Content preview: {resp.content[:200]}")
+    
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
         xml_data = z.read(z.namelist()[0])
     root = ET.fromstring(xml_data)
@@ -151,7 +169,6 @@ ASSETS_IDS = {"ifrs-full_Assets"}
 LIAB_IDS = {"ifrs-full_Liabilities"}
 EQUITY_IDS = {"ifrs-full_Equity","ifrs-full_EquityAttributableToOwnersOfParent"}
 
-# 매출 후보(금융/수수료형 보강)
 REV_NAME_RE = re.compile(
     r"(매\s*출|매출액|영업수익|상품매출|제품매출|수수료수익|이자수익|보험료수익|수익\(영업\))",
     re.I
@@ -167,7 +184,6 @@ def _parse_amount(v):
     s = str(v).replace(",", "").strip()
     if s in {"", "-", "–"}: return None
     try:
-        # DART는 '원' 단위가 기본. 숫자는 그대로 유지(시트에서 E+11 표시는 서식 문제)
         return int(float(s))
     except:
         return None
@@ -190,12 +206,17 @@ def _pick_by_id_or_name(items, id_set, name_re, used):
     return None, None
 
 # =========================
-# DART 조회 (CFS 우선, 핵심값 없으면 OFS 폴백)
+# DART 조회 (수정: 호출 횟수 반환)
 # =========================
 def fetch_financials(corp_code, year, reprt_code, ticker=None):
+    """
+    반환값: (재무데이터 dict, API 호출 횟수)
+    """
     url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    calls_made = 0
 
     def _one(fs_div):
+        nonlocal calls_made
         params = {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
@@ -204,6 +225,8 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
             "fs_div": fs_div,
         }
         resp = _get_with_retry(url, params)
+        calls_made += 1  # API 호출 카운트
+        
         if not resp:
             return None
         try:
@@ -247,7 +270,8 @@ def fetch_financials(corp_code, year, reprt_code, ticker=None):
         if alt:
             out = alt
 
-    return out or {"매출액":None,"영업이익":None,"당기순이익":None,"자산총계":None,"부채총계":None,"자기자본":None}
+    result = out or {"매출액":None,"영업이익":None,"당기순이익":None,"자산총계":None,"부채총계":None,"자기자본":None}
+    return result, calls_made
 
 # =========================
 # 분기 단품 계산 (음수 허용, 결측은 None 유지)
@@ -259,7 +283,7 @@ def _v(d, key):
 
 def _sub(a, b):
     if a is None or b is None: return None
-    return a - b  # 음수 허용
+    return a - b
 
 def make_quarter_single(series):
     Q1, H1, Q3, AN = [series.get(x, {}) for x in ("Q1","H1","Q3","ANNUAL")]
@@ -284,8 +308,51 @@ def build_tasks(corp_map, years, quarters):
     return [(t, c, y, rc, qn) for t, c in corp_map.items() for y in years for rc, qn in quarters]
 
 # =========================
-# 기존 시트 0/빈칸 자동 수정
-#  - 해당 (ticker,year) 전체를 재계산하여 기존 행을 "제자리 업데이트"
+# 기존 데이터 로드 (중복 방지용)
+# =========================
+def load_existing_data(ws):
+    """
+    시트에서 기존 데이터를 로드하여 (ticker, year, quarter) 세트 반환
+    """
+    try:
+        all_vals = ws.get_all_values()
+        if not all_vals or len(all_vals) < 2:
+            return set(), {}
+        
+        header = all_vals[0]
+        try:
+            idx_ticker = header.index("ticker")
+            idx_year = header.index("year")
+            idx_quarter = header.index("quarter")
+            idx_corp = header.index("corp_code")
+        except ValueError:
+            return set(), {}
+        
+        existing = set()
+        row_map = {}  # (ticker, year, quarter) -> row_index
+        
+        for rno, row in enumerate(all_vals[1:], start=2):
+            if len(row) <= max(idx_ticker, idx_year, idx_quarter):
+                continue
+            try:
+                tic = row[idx_ticker].strip()
+                yr = row[idx_year].strip()
+                q = row[idx_quarter].strip()
+                if tic and yr and q:
+                    key = (tic, yr, q)
+                    existing.add(key)
+                    row_map[key] = rno
+            except:
+                continue
+        
+        print(f"[EXISTING] Loaded {len(existing)} existing records", flush=True)
+        return existing, row_map
+    except Exception as e:
+        print(f"[WARN] Failed to load existing data: {e}", flush=True)
+        return set(), {}
+
+# =========================
+# 기존 시트 0/빈칸 자동 수정 (수정: API 호출 카운트 정확히 반영)
 # =========================
 def repair_zero_rows(ws, corp_map, years, api_calls_left):
     print("[REPAIR] start scanning sheet zeros", flush=True)
@@ -314,7 +381,7 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
             continue
         pos.setdefault((tic, yr), {})[q] = rno
 
-    # “수정 대상” 선정: 핵심값이 0 또는 빈칸인 행이 하나라도 있는 (ticker,year)
+    # "수정 대상" 선정
     targets = set()
     for (tic, yr), qrows in pos.items():
         for q in ("Q1","Q2","Q3","Q4"):
@@ -335,17 +402,16 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
 
     print(f"[REPAIR] candidates: {len(targets)}", flush=True)
 
-    # 재계산 (Q1/H1/Q3/AN 조회 → 단품 산출 → 기존 행 업데이트)
     reprts = [("11013","Q1"),("11012","H1"),("11014","Q3"),("11011","ANNUAL")]
     fixed = 0
+    total_calls_used = 0
 
-    # 간단한 레이트 리밋: 남은 콜보다 많이 쓰지 않음
     for (tic, yr) in targets:
-        if api_calls_left <= 0:
+        if api_calls_left - total_calls_used <= 0:
             print("[REPAIR] hit call limit during repair", flush=True)
             break
+        
         corp_code = None
-        # 시트의 corp_code 사용 우선
         any_q = pos[(tic,yr)].get("Q1") or pos[(tic,yr)].get("Q2") or pos[(tic,yr)].get("Q3") or pos[(tic,yr)].get("Q4")
         if any_q:
             row = all_vals[any_q-1]
@@ -357,14 +423,12 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
             continue
 
         series = {}
-        calls_used = 0
         for rc, qn in reprts:
-            if api_calls_left - calls_used <= 0:
+            if api_calls_left - total_calls_used <= 0:
                 break
-            out = fetch_financials(corp_code, yr, rc, ticker=tic)
-            calls_used += 1  # CFS 1회 + (필요시) OFS 추가 1회를 더 세고 싶다면 fetch 내부에서 별도 리턴으로 바꾸세요.
+            out, calls = fetch_financials(corp_code, yr, rc, ticker=tic)
+            total_calls_used += calls
             series[qn] = out
-        api_calls_left -= calls_used
 
         singles = make_quarter_single(series)
         for q in ("Q1","Q2","Q3","Q4"):
@@ -381,11 +445,12 @@ def repair_zero_rows(ws, corp_map, years, api_calls_left):
             update_row_safe(ws, rno, new_row)
             fixed += 1
 
-    print(f"[REPAIR] updated rows: {fixed}", flush=True)
+    api_calls_left -= total_calls_used
+    print(f"[REPAIR] updated rows: {fixed}, calls_used: {total_calls_used}", flush=True)
     return fixed, api_calls_left
 
 # =========================
-# 메인 수집
+# 메인 수집 (수정: 중복 방지 + API 카운트 정확)
 # =========================
 def collect_financials():
     sheet = open_sheet()
@@ -398,6 +463,9 @@ def collect_financials():
         ws.insert_row(
             ["ticker","corp_code","year","quarter","date",
              "매출액","영업이익","당기순이익","자기자본","부채총계","자산총계"], 1)
+
+    # 기존 데이터 로드
+    existing_data, row_map = load_existing_data(ws)
 
     corp_map = get_corp_code_map()
 
@@ -412,7 +480,7 @@ def collect_financials():
     tasks = build_tasks(corp_map, years, quarters)
     print(f"[TASKS] {len(tasks)}", flush=True)
 
-    # (옵션) 기존 0/빈칸 행 우선 수정
+    # 기존 0/빈칸 행 우선 수정
     api_calls_left = MAX_DAILY_CALLS
     if RUN_REPAIR_ZERO:
         fixed, api_calls_left = repair_zero_rows(ws, corp_map, set(years), api_calls_left)
@@ -423,12 +491,14 @@ def collect_financials():
     done_today = set()
 
     api_calls_lock = threading.Lock()
-    def take_call():
+    
+    def take_calls(n):
+        """n개의 API 호출 여유가 있는지 확인하고 차감"""
         nonlocal api_calls_left
         with api_calls_lock:
-            if api_calls_left <= 0:
+            if api_calls_left < n:
                 return False
-            api_calls_left -= 1
+            api_calls_left -= n
             return True
 
     def worker(task):
@@ -436,10 +506,19 @@ def collect_financials():
         key = f"{ticker}-{year}-{q_name}"
         if key in done:
             return None
-        # 콜 여유 확인
-        if not take_call():
+        
+        # 최대 2회 호출 가능성 대비 (CFS + OFS)
+        if not take_calls(2):
             return "LIMIT"
-        fin = fetch_financials(corp_code, year, reprt_code, ticker=ticker)
+        
+        fin, calls_made = fetch_financials(corp_code, year, reprt_code, ticker=ticker)
+        
+        # 실제 사용한 만큼만 차감했으므로, 남은 건 반환
+        unused = 2 - calls_made
+        if unused > 0:
+            with api_calls_lock:
+                api_calls_left += unused
+        
         done_today.add(key)
         return (ticker, corp_code, year, q_name, fin)
 
@@ -468,7 +547,7 @@ def collect_financials():
     # 체크포인트 저장
     save_checkpoint(done.union(done_today))
 
-    # 단품 계산 후 저장 (빈칸/음수 허용)
+    # 단품 계산 후 저장 (중복 필터링 추가)
     print("[STEP] Calculating quarter singles...", flush=True)
     rows = []
     def _cell(v): return "" if v is None else v
@@ -477,9 +556,15 @@ def collect_financials():
         corp_code = s.get("corp_code","")
         singles = make_quarter_single(s)
         for q in ("Q1","Q2","Q3","Q4"):
+            # 중복 체크
+            if (ticker, year, q) in existing_data:
+                if DEBUG_TICKER and ticker == DEBUG_TICKER:
+                    print(f"[SKIP] Duplicate: {ticker}-{year}-{q}", flush=True)
+                continue
+            
             fin = singles.get(q, {})
             core = [fin.get("매출액"), fin.get("영업이익"), fin.get("당기순이익")]
-            # 핵심 모두 결측이면 행 생략(가짜 0 방지)
+            # 핵심 모두 결측이면 행 생략
             if all(v is None for v in core):
                 continue
             rows.append([
@@ -499,3 +584,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[FATAL] {e}", flush=True)
         import traceback; traceback.print_exc()
+        sys.exit(1)
