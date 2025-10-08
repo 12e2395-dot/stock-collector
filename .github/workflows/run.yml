@@ -1,15 +1,13 @@
 name: run-collector-daily
-
 on:
   schedule:
-    - cron: '0 16 * * *'   # 매일 01:00 JST (UTC 16:00)
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       reset:
-        description: 'Delete checkpoint before run? (use when sheet is empty/full rebuild)'
+        description: 'Delete checkpoint before run?'
         type: boolean
         default: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -17,19 +15,16 @@ jobs:
     concurrency:
       group: dart-collector
       cancel-in-progress: false
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - run: |
           pip install -r requirements.txt
           pip install google-auth
-
-      # 체크포인트 복원(전날 이어서)
+      
+      # 체크포인트 복원
       - name: Restore checkpoint
         uses: actions/cache@v4
         with:
@@ -37,39 +32,32 @@ jobs:
           key: dart-checkpoint-${{ github.ref_name }}
           restore-keys: |
             dart-checkpoint-
-
-      # ✅ 지금은 '항상' 리셋 (시트 비웠으니 풀빌드)
-      #   나중에 이어달리기 원하면 이 스텝을 주석 처리하거나 아래 조건부(수동 실행 시에만)로 바꾸세요.
-      - name: Reset DART checkpoint (always for full rebuild)
+      
+      # 수동 실행 시에만 리셋
+      - name: Reset checkpoint (manual only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset }}
         run: rm -f dart_checkpoint.json || true
-
-      # (선택) 수동 실행에서만 리셋하고 싶을 때 사용
-      # - name: Reset DART checkpoint (manual only)
-      #   if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset }}
-      #   run: rm -f dart_checkpoint.json || true
-
+      
       - name: Run daily collector (PyKRX)
         run: python -u collector_v1.py
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SLEEP_SEC: '0.5'
-
+      
       - name: Run financial collector (OpenDart)
         run: python -u collector_dart.py
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
-          # === 실행 파라미터 ===
           MAX_DAILY_CALLS: '30000'
-          SAMPLE_TICKERS: '0'                # 전체
-          FS_DIV_ONLY_CFS: '1'               # 연결 먼저 (빠름)
-          TREAT_OPERATING_REVENUE_AS_SALES: '1'  # 금융업 대응
-          RUN_REPAIR_ZERO: '0'               # 시트 비었으니 OFF (콜 절약)
-          # YEARS: '2024,2025'               # 필요 시 범위 고정
-
-      # 체크포인트 저장(내일 이어서)
+          SAMPLE_TICKERS: '0'
+          FS_DIV_ONLY_CFS: '1'
+          TREAT_OPERATING_REVENUE_AS_SALES: '1'
+          RUN_REPAIR_ZERO: '0'
+      
+      # 체크포인트 저장
       - name: Save checkpoint
         if: always()
         uses: actions/cache@v4
